@@ -1,0 +1,168 @@
+# NixOS module for the IWCB Telegram Bot.
+# Source: https://github.com/IndieWebClubBlr/telegram-bot
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+
+let
+  cfg = config.services.iwcb-telegram-bot;
+
+  # Non-secret settings, as an environment file so that systemd's
+  # EnvironmentFile > Environment= precedence cannot be subverted by
+  # the secrets file. Option types (alphanumeric ID, int list, IANA
+  # time zone pattern) keep every value free of newlines and spaces.
+  optionsEnvFile = pkgs.writeText "iwcb-options.env" (
+    ''
+      TODOIST_PROJECT_ID=${cfg.projectId}
+      ALLOWED_CHAT_IDS=${lib.concatMapStringsSep "," toString cfg.allowedChatIds}
+    ''
+    + lib.optionalString (cfg.timeZone != null) "TIMEZONE=${cfg.timeZone}\n"
+  );
+in
+{
+  options.services.iwcb-telegram-bot = {
+    enable = lib.mkEnableOption "the IWCB Telegram Bot";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = import ./default.nix { inherit pkgs; };
+      defaultText = lib.literalExpression "import ./default.nix { inherit pkgs; }";
+      description = "The bot package to run.";
+    };
+
+    projectId = lib.mkOption {
+      type = lib.types.strMatching "[A-Za-z0-9]+";
+      example = "6X4Vw2Hfmg73Q2XR";
+      description = ''
+        Todoist project ID: the part after the last dash of the project
+        URL, https://app.todoist.com/app/project/<name-slug>-<id>.
+        Loaded once at startup; the bot refuses to start if the ID does
+        not exist. Alphanumeric only, so it is safe to write into the
+        generated environment file.
+      '';
+    };
+
+    allowedChatIds = lib.mkOption {
+      type = lib.types.listOf lib.types.int;
+      example = [ 123456789 ];
+      description = ''
+        Telegram chat IDs allowed to use the bot. Messages from any
+        other chat are ignored.
+      '';
+    };
+
+    timeZone = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "[A-Za-z0-9_+/-]+");
+      default = null;
+      example = "Asia/Kolkata";
+      description = ''
+        IANA time zone the bot uses for its "today" calculations
+        (TIMEZONE). The server and the bot's users are often in
+        different time zones, so this should usually be the users'
+        time zone rather than the server's. When null, the bot falls
+        back to the server's local time zone.
+      '';
+    };
+
+    environmentFile = lib.mkOption {
+      type = lib.types.str;
+      example = "/run/secrets-rendered/iwcb-bot.env";
+      description = ''
+        Absolute path to a systemd EnvironmentFile providing
+        TELEGRAM_BOT_TOKEN and TODOIST_API_TOKEN, e.g. a sops-nix
+        template path. Must be a string, not a Nix path literal —
+        path literals are copied into the world-readable Nix store.
+        Non-secret settings come from the options above and are
+        written to a second environment file listed after this one,
+        so the options win even if this file also sets
+        TODOIST_PROJECT_ID, ALLOWED_CHAT_IDS or TIMEZONE.
+      '';
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = lib.hasPrefix "/" cfg.environmentFile;
+        message = ''services.iwcb-telegram-bot.environmentFile must be an absolute path string, e.g. "/run/secrets-rendered/iwcb-bot.env"'';
+      }
+    ];
+
+    # systemd reads EnvironmentFile entries in order and later files
+    # override earlier ones (and all files override Environment=), so
+    # the generated options file must come last.
+    systemd.services.iwcb-telegram-bot = {
+      description = "IWCB Telegram Bot";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" ];
+
+      # Start limits are [Unit] keys (systemd >= 230); under
+      # serviceConfig they would land in [Service] and be ignored.
+      unitConfig = {
+        # Backstop so a persistent failure (e.g. bad bot token, HTTP 401)
+        # stops after 5 attempts instead of looping every 5 s forever.
+        StartLimitIntervalSec = 300;
+        StartLimitBurst = 5;
+      };
+
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/iwcb-telegram-bot";
+        EnvironmentFile = [
+          cfg.environmentFile
+          "${optionsEnvFile}"
+        ];
+        Environment = [ "PYTHONUNBUFFERED=1" ];
+
+        Restart = "on-failure";
+        RestartSec = 5;
+        # Exit code 2 = configuration error: never restart on it.
+        RestartPreventExitStatus = "2";
+        TimeoutStopSec = 30;
+
+        DynamicUser = true;
+        UMask = "0077";
+        NoNewPrivileges = true;
+        CapabilityBoundingSet = "";
+        AmbientCapabilities = "";
+
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        PrivateMounts = true;
+        PrivateIPC = true;
+        PrivateUsers = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        RemoveIPC = true;
+
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_INET"
+          "AF_INET6"
+        ];
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        SystemCallArchitectures = "native";
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+        ];
+        SystemCallErrorNumber = "EPERM";
+      };
+    };
+  };
+}

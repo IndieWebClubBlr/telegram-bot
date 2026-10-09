@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iwcb-telegram-bot"
+version = "0.1.0"
+description = "IWCB Telegram Bot — a Telegram bot for IWCB"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "python-telegram-bot>=22,<23",
+    "todoist-api-python>=3,<4",
+    "markdown-it-py>=3,<5",
+    "linkify-it-py>=2,<3",
+]
+
+[project.scripts]
+iwcb-telegram-bot = "iwcb_bot.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iwcb_bot"]
+
+[tool.black]
+target-version = ["py310"]
+
+[tool.basedpyright]
+include = ["src", "tests"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
