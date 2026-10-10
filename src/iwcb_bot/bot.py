@@ -36,6 +36,7 @@ _DISPLAY_LIMIT = 500
 _BODY_LIMIT = 3500
 _TYPING_INTERVAL = 4.0
 _NBSP = "\N{NO-BREAK SPACE}"
+_LIST_CMDS = "/today, /tomorrow or /week"
 
 _md = MarkdownIt("gfm-like", {"html": False}).disable("image")
 # Telegram only accepts http(s) and tg links; markdown-it's default
@@ -45,7 +46,7 @@ _md.validateLink = lambda url: url.startswith(("http://", "https://", "tg://"))
 _HELP = """\
 Commands (project: {project}):
 
-/add <text> — add a task, quick-add syntax: "buy milk tomorrow p1 @errand"
+/add <text> — add a task, quick-add syntax: "buy milk tomorrow p1 @chore /regular +Abhinav"
 /today — tasks due today or overdue, each with a short id
 /tomorrow — tasks due by end of tomorrow
 /week — tasks due by end of the next 6 days
@@ -53,20 +54,22 @@ Commands (project: {project}):
 /undo <id> — reopen a task completed via /done (not recurring)
 /edit <id> <new text> — edit the task with that id
 /project — link to this project in Todoist
-/help — this message
+/start or /help — this message
 
-ids are shown in lowercase and matched case-insensitively
-/today, /tomorrow and /week show the list that /done, /undo and /edit act on
-"""
+- ids are shown in lowercase and matched case-insensitively
+- {list_cmds} show the list that /done, /undo and /edit act on;
+  edits appear in that message only — refresh with {list_cmds} to re-fetch
+- /add refreshes the shown list when the new task falls inside its range
+""".replace("{list_cmds}", _LIST_CMDS)
 
 
 def guarded(handler: Handler, *, typing: bool = False) -> Handler:
     @functools.wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ticker: asyncio.Task[None] | None = None
-        if typing:
-            ticker = await _start_typing(update, context)
         try:
+            if typing:
+                ticker = await _start_typing(update, context)
             await handler(update, context)
         except TodoistError as exc:
             logger.warning("%s failed: %s", handler.__name__, exc)
@@ -75,8 +78,8 @@ def guarded(handler: Handler, *, typing: bool = False) -> Handler:
             logger.exception("Telegram error in %s", handler.__name__)
             await _reply_safely(
                 update,
-                "⚠ Telegram send failed — the command may have "
-                "completed; check with /today",
+                f"⚠ Telegram send failed — the command may have "
+                f"completed; check with {_LIST_CMDS}",
             )
         except Exception:
             logger.exception("Unhandled error in %s", handler.__name__)
@@ -119,7 +122,9 @@ async def _start_typing(
                 logger.debug("chat action failed: %s", exc)
             await asyncio.sleep(_TYPING_INTERVAL)
 
-    return asyncio.create_task(ticker())
+    # application.create_task (not asyncio.create_task) so shutdown
+    # waits for the ticker; the name aids debugging in task dumps.
+    return context.application.create_task(ticker(), name=f"typing:{chat.id}")
 
 
 async def _stop_typing(ticker: asyncio.Task[None] | None) -> None:
@@ -228,6 +233,7 @@ class _ListState:
     day: date
     cutoff: date
     items: list[_ListItem]
+    headline: str | None = None
 
 
 def _task_suffixes(task_ids: list[str]) -> list[str]:
@@ -261,12 +267,12 @@ def _render_list(items: list[_ListItem], today: date, *, show_dates: bool) -> st
     width = max((len(suffix) for suffix in suffixes), default=0)
     lines: list[str] = []
     for suffix, item in zip(suffixes, items, strict=True):
-        marker = "⚠ " if item.due < today else ""
+        marker = "⚠ " if item.due < today and not item.done else ""
         body = _render_text(item.text)
         if item.done:
             body = f"<s>{body}</s>"
         padded = suffix.ljust(width, _NBSP)
-        line = f"<code>{html.escape(padded)}</code>  {marker}{body}"
+        line = f"<code>[{padded}]</code>  {marker}{body}"
         if show_dates or (item.due < today and not item.done):
             line += f" — due {_fmt_due(item.due)}"
         lines.append(line)
@@ -318,7 +324,13 @@ async def _send_list(
         await message.reply_text(chunk, parse_mode=ParseMode.HTML)
     _set_state(
         context,
-        _ListState(message_id=message_id, day=today, cutoff=cutoff, items=items),
+        _ListState(
+            message_id=message_id,
+            day=today,
+            cutoff=cutoff,
+            items=items,
+            headline=headline,
+        ),
     )
 
 
@@ -344,16 +356,24 @@ async def _edit_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     state: _ListState,
-    today: date,
 ) -> None:
+    """Re-render the stored list message from its state.
+
+    Renders with state.day — not the current clock — so a strike applied
+    just after midnight still draws against the day the list was built
+    for, and the message the user is looking at stays consistent.
+    """
     if state.message_id is None:
         return
     chat = update.effective_chat
     if chat is None:
         return
+    today = state.day
     rendered = _render_list(state.items, today, show_dates=state.cutoff > today)
     if state.cutoff > today:
         rendered = f"<b>Due by {_fmt_due(state.cutoff)}:</b>\n{rendered}"
+    if state.headline is not None:
+        rendered = f"{state.headline}\n\n{rendered}"
     if len(rendered) > _TELEGRAM_LIMIT:
         logger.warning("rendered list is %d chars, skipping edit", len(rendered))
         return
@@ -367,6 +387,11 @@ async def _edit_list(
     except BadRequest as exc:
         if "not modified" in str(exc):
             logger.debug("list message already up to date")
+        elif "message to edit not found" in str(exc).casefold():
+            # User deleted the list message; stop editing it and stop
+            # spamming exception logs on every strike.
+            logger.debug("list message deleted; clearing edit target")
+            state.message_id = None
         else:
             logger.exception("could not edit list message")
     except TelegramError:
@@ -376,6 +401,12 @@ async def _edit_list(
 def build_application(
     cfg: Config, project: Project, todoist: TodoistClient
 ) -> Application:
+    # NOTE: the Application is built without concurrent_updates, so PTB
+    # processes updates strictly one at a time (SimpleUpdateProcessor,
+    # max_concurrent_updates=1).  The list handlers rely on this: each
+    # is a read-modify-write of chat_data["list"] across awaits with no
+    # lock.  Enabling concurrent_updates would interleave those at await
+    # points — add a per-chat asyncio.Lock before ever setting it.
     auth = (
         filters.Chat(chat_id=sorted(cfg.allowed_chat_ids)) & ~filters.UpdateType.EDITED
     )
@@ -391,9 +422,12 @@ def build_application(
                 "Usage: /add <task text> — e.g. /add buy milk tomorrow p1",
             )
             return
-        today = cfg.today()
+        if len(text) > 500:
+            await _reply(update, "Task text too long — max 500 characters")
+            return
         task = await todoist.add_task_in_project(text, project)
-        day = effective_day(task.due, task.deadline)
+        today = cfg.today()
+        day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
         detail = f" (due {_fmt_due(day)})" if day is not None else ""
         headline = f"✅ Added: {_render_text(task.content)}{detail}"
         state = _get_state(context)
@@ -403,16 +437,25 @@ def build_application(
         if day is None or day > cutoff:
             await _reply_html(update, headline)
             return
-        tasks = await todoist.tasks_due_by(project.id, cutoff)
+        try:
+            tasks = await todoist.tasks_due_by(project.id, cutoff)
+        except TodoistError:
+            # The add itself succeeded — report it; only the list
+            # refresh failed.
+            await _reply_html(
+                update, f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}"
+            )
+            return
         await _send_list(update, context, tasks, today, cutoff, headline=headline)
 
-    def _cmd_list(days: int) -> Handler:
+    def _cmd_list(days: int, name: str) -> Handler:
         async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             today = cfg.today()
             cutoff = today + timedelta(days=days)
             tasks = await todoist.tasks_due_by(project.id, cutoff)
             await _send_list(update, context, tasks, today, cutoff)
 
+        cmd.__name__ = name
         return guarded(cmd, typing=True)
 
     async def _require_state(
@@ -422,14 +465,13 @@ def build_application(
         today = cfg.today()
         state = _get_state(context)
         if state is None:
-            await _reply(update, "Send /today, /tomorrow or /week first")
+            await _reply(update, f"Send {_LIST_CMDS} first")
             return None
         if state.day != today:
             _set_state(context, None)
             await _reply(
                 update,
-                "The last list is from a previous day — "
-                "send /today, /tomorrow or /week",
+                f"The last list is from a previous day — send {_LIST_CMDS}",
             )
             return None
         return state
@@ -437,9 +479,7 @@ def build_application(
     async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = " ".join(context.args or []).strip()
         if not query:
-            await _reply(
-                update, "Usage: /done <id> — id shown by /today, /tomorrow or /week"
-            )
+            await _reply(update, f"Usage: /done <id> — id shown by {_LIST_CMDS}")
             return
         state = await _require_state(update, context)
         if state is None:
@@ -456,10 +496,15 @@ def build_application(
             )
             return
         item = next(item for item in state.items if item.task_id == resolved[0])
+        if item.done:
+            # Never call the API again: for a recurring task a second
+            # complete would close the *next* occurrence.
+            await _reply(update, f"Already completed — send {_LIST_CMDS} to refresh")
+            return
         try:
             await todoist.complete_task(item.task_id)
         except TodoistError as exc:
-            await _reply(update, f"⚠ {exc} — send /today to refresh")
+            await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
             return
         next_due: date | None = None
         if item.recurring:
@@ -471,7 +516,11 @@ def build_application(
             except TodoistError:
                 logger.warning("could not read next occurrence of %s", item.task_id)
         item.done = True
-        await _edit_list(update, context, state, cfg.today())
+        if next_due is not None:
+            # Show the rolled occurrence's date instead of the stale one
+            # the user just completed.
+            item.due = next_due
+        await _edit_list(update, context, state)
         if item.recurring and next_due is not None:
             await _reply_html(
                 update,
@@ -484,9 +533,7 @@ def build_application(
     async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = " ".join(context.args or []).strip()
         if not query:
-            await _reply(
-                update, "Usage: /undo <id> — id shown by /today, /tomorrow or /week"
-            )
+            await _reply(update, f"Usage: /undo <id> — id shown by {_LIST_CMDS}")
             return
         state = await _require_state(update, context)
         if state is None:
@@ -507,15 +554,19 @@ def build_application(
             await _reply(update, "Not completed — nothing to undo")
             return
         if item.recurring:
+            # Blanket refusal: undoing a rolled completion is unsafe (the
+            # series already advanced); a series that *ended* on the last
+            # occurrence could be undone, but distinguishing the two
+            # needs extra state — accepted false negative.
             await _reply(update, "⚠ can't undo a recurring completion")
             return
         try:
             await todoist.uncomplete_task(item.task_id)
         except TodoistError as exc:
-            await _reply(update, f"⚠ {exc} — send /today to refresh")
+            await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
             return
         item.done = False
-        await _edit_list(update, context, state, cfg.today())
+        await _edit_list(update, context, state)
         await _reply_html(update, f"↩️ {_render_text(item.text)}")
 
     async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -546,13 +597,16 @@ def build_application(
             )
             return
         item = next(item for item in state.items if item.task_id == resolved[0])
+        if item.done:
+            await _reply(update, "Already completed — can't edit")
+            return
         try:
             await todoist.update_task_content(item.task_id, new_text)
         except TodoistError as exc:
-            await _reply(update, f"⚠ {exc} — send /today to refresh")
+            await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
             return
         item.text = new_text
-        await _edit_list(update, context, state, cfg.today())
+        await _edit_list(update, context, state)
         await _reply_html(update, f"✏️ {_render_text(new_text)}")
 
     async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -598,9 +652,15 @@ def build_application(
     application.add_handler(
         CommandHandler("add", guarded(cmd_add, typing=True), filters=auth)
     )
-    application.add_handler(CommandHandler("today", _cmd_list(0), filters=auth))
-    application.add_handler(CommandHandler("tomorrow", _cmd_list(1), filters=auth))
-    application.add_handler(CommandHandler("week", _cmd_list(6), filters=auth))
+    application.add_handler(
+        CommandHandler("today", _cmd_list(0, "cmd_today"), filters=auth)
+    )
+    application.add_handler(
+        CommandHandler("tomorrow", _cmd_list(1, "cmd_tomorrow"), filters=auth)
+    )
+    application.add_handler(
+        CommandHandler("week", _cmd_list(6, "cmd_week"), filters=auth)
+    )
     application.add_handler(
         CommandHandler("done", guarded(cmd_done, typing=True), filters=auth)
     )

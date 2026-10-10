@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, tzinfo
+from datetime import date, datetime, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -31,9 +31,18 @@ class Config:
         )
 
     def today(self) -> date:
-        if self.timezone is None:
-            return datetime.now().astimezone().date()
-        return datetime.now(tz=self.timezone).date()
+        return datetime.now(tz=self.resolved_timezone).date()
+
+    @property
+    def resolved_timezone(self) -> tzinfo:
+        """The timezone all day-boundary math uses.
+
+        TIMEZONE when set; the server's local zone otherwise — same
+        fallback as today().
+        """
+        if self.timezone is not None:
+            return self.timezone
+        return datetime.now().astimezone().tzinfo or timezone.utc
 
 
 def _require(env: Mapping[str, str], name: str) -> str:

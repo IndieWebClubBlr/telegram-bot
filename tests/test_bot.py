@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from todoist_api_python.models import Deadline, Due
@@ -10,12 +11,14 @@ from iwcb_bot.bot import (
     _chunk,
     _ListItem,
     _md_html,
+    _NBSP,
     _one_line,
     _render_list,
     _render_text,
     _resolve_ids,
     _task_suffixes,
 )
+from iwcb_bot.config import Config
 from iwcb_bot.todoist_client import _project_token, effective_day
 
 TODAY = date(2026, 10, 9)
@@ -235,13 +238,26 @@ class TestRenderList:
         ]
         out = _render_list(items, TODAY, show_dates=False)
         assert '<a href="https://events.indieweb.org">' in out
-        assert out.startswith("<code>")
+        assert out.startswith("<code>[")
+        assert out.endswith(
+            '</code>  Post on <a href="https://events.indieweb.org">events.indieweb.org</a>'
+        )
 
     def test_multiline_text_stays_on_one_line(self) -> None:
         items = [_ListItem(task_id="aa", text="a\nb", due=TODAY)]
         out = _render_list(items, TODAY, show_dates=False)
         assert "\n" not in out
         assert "a b" in out
+
+    def test_ids_bracketed_in_code_run(self) -> None:
+        items = [
+            _ListItem(task_id="zab", text="one", due=TODAY),
+            _ListItem(task_id="ab", text="two", due=TODAY),
+        ]
+        out = _render_list(items, TODAY, show_dates=False)
+        assert "<code>[zab]</code>" in out
+        # narrower id is padded so both code runs share one width
+        assert f"<code>[ab{_NBSP}]</code>" in out
 
     def test_long_text_truncated(self) -> None:
         items = [_ListItem(task_id="aa", text="x" * 600, due=TODAY)]
@@ -330,35 +346,85 @@ def _deadline(day: date) -> Deadline:
     return Deadline.from_dict({"date": day.isoformat()})
 
 
+_KOLKATA = ZoneInfo("Asia/Kolkata")  # UTC+5:30
+_UTC = timezone.utc
+
+
 class TestEffectiveDay:
     def test_neither_due_nor_deadline(self) -> None:
-        assert effective_day(None, None) is None
+        assert effective_day(None, None, _KOLKATA) is None
 
     def test_due_only(self) -> None:
-        assert effective_day(_due(date(2026, 10, 10)), None) == date(2026, 10, 10)
+        assert effective_day(_due(date(2026, 10, 10)), None, _KOLKATA) == date(
+            2026, 10, 10
+        )
 
     def test_deadline_only(self) -> None:
-        assert effective_day(None, _deadline(date(2026, 10, 10))) == date(2026, 10, 10)
+        assert effective_day(None, _deadline(date(2026, 10, 10)), _KOLKATA) == date(
+            2026, 10, 10
+        )
 
-    def test_due_datetime_coerced(self) -> None:
-        due = Due.from_dict({"date": "2026-10-10T17:30:00", "string": "5pm"})
-        assert effective_day(due, None) == date(2026, 10, 10)
+    def test_due_naive_datetime_kept_in_configured_zone(self) -> None:
+        due = Due.from_dict({"date": "2026-10-10T23:30:00", "string": "11:30pm"})
+        assert effective_day(due, None, _KOLKATA) == date(2026, 10, 10)
 
-    def test_deadline_datetime_coerced(self) -> None:
-        deadline = Deadline.from_dict({"date": "2026-10-10T17:30:00"})
-        assert effective_day(None, deadline) == date(2026, 10, 10)
+    def test_deadline_naive_datetime_kept_in_configured_zone(self) -> None:
+        deadline = Deadline.from_dict({"date": "2026-10-10T23:30:00"})
+        assert effective_day(None, deadline, _KOLKATA) == date(2026, 10, 10)
+
+    def test_due_aware_datetime_converted_to_configured_zone(self) -> None:
+        # 18:30Z = 00:00 IST next day — the instant's IST day wins.
+        due = Due.from_dict({"date": "2026-10-10T18:30:00Z", "string": "x"})
+        assert effective_day(due, None, _KOLKATA) == date(2026, 10, 11)
+
+    def test_due_aware_datetime_same_day_when_not_past_midnight(self) -> None:
+        # 18:00Z = 23:30 IST — still the same calendar day.
+        due = Due.from_dict({"date": "2026-10-10T18:00:00Z", "string": "x"})
+        assert effective_day(due, None, _KOLKATA) == date(2026, 10, 10)
+
+    def test_due_aware_datetime_converted_to_utc_zone(self) -> None:
+        # Same instant, UTC configured: stays on the 10th.
+        due = Due.from_dict({"date": "2026-10-10T18:30:00Z", "string": "x"})
+        assert effective_day(due, None, _UTC) == date(2026, 10, 10)
+
+    def test_deadline_aware_datetime_converted_to_configured_zone(self) -> None:
+        deadline = Deadline.from_dict({"date": "2026-10-10T18:30:00Z"})
+        assert effective_day(None, deadline, _KOLKATA) == date(2026, 10, 11)
 
     def test_due_earlier_than_deadline(self) -> None:
         assert effective_day(
-            _due(date(2026, 10, 9)), _deadline(date(2026, 10, 10))
+            _due(date(2026, 10, 9)), _deadline(date(2026, 10, 10)), _KOLKATA
         ) == date(2026, 10, 9)
 
     def test_deadline_earlier_than_due(self) -> None:
         assert effective_day(
-            _due(date(2026, 10, 10)), _deadline(date(2026, 10, 9))
+            _due(date(2026, 10, 10)), _deadline(date(2026, 10, 9)), _KOLKATA
         ) == date(2026, 10, 9)
 
     def test_equal_days(self) -> None:
         assert effective_day(
-            _due(date(2026, 10, 10)), _deadline(date(2026, 10, 10))
+            _due(date(2026, 10, 10)), _deadline(date(2026, 10, 10)), _KOLKATA
         ) == date(2026, 10, 10)
+
+
+def _config(**overrides: object) -> Config:
+    values: dict[str, object] = {
+        "telegram_token": "t" * 40,
+        "todoist_token": "0" * 36,
+        "project_id": "2200000000",
+        "allowed_chat_ids": frozenset({1}),
+        "timezone": None,
+    }
+    values.update(overrides)
+    return Config(**values)  # type: ignore[arg-type]
+
+
+class TestResolvedTimezone:
+    def test_configured_timezone_preferred(self) -> None:
+        cfg = _config(timezone=_KOLKATA)
+        assert cfg.resolved_timezone is _KOLKATA
+
+    def test_unset_falls_back_to_server_local(self) -> None:
+        cfg = _config()
+        expected = datetime.now().astimezone().tzinfo
+        assert cfg.resolved_timezone == expected
