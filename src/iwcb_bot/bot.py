@@ -209,8 +209,15 @@ def _render_text(raw: str) -> str:
     return out
 
 
-def _fmt_due(day: date) -> str:
-    return f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
+def _fmt_due(day: date, reference: date) -> str:
+    """`Tue 9 Jun`, or `Tue 9 Jun 25` when the year differs from the
+    reference (usually the day the list was built for). Near-today lists
+    stay compact; old overdue items and year-boundary ranges disambiguate.
+    """
+    formatted = f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
+    if day.year != reference.year:
+        formatted += f" {day.strftime('%y')}"
+    return formatted
 
 
 def _one_line(text: str, limit: int = _DISPLAY_LIMIT) -> str:
@@ -309,7 +316,7 @@ def _render_list(items: list[_ListItem], today: date, *, show_dates: bool) -> st
         padded = suffix.ljust(width, _NBSP)
         line = f"<code>[{padded}]</code>  {marker}{body}"
         if show_dates or (item.due < today and not item.done):
-            line += f" — due {_fmt_due(item.due)}"
+            line += f" — due {_fmt_due(item.due, today)}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -338,7 +345,7 @@ def _render_list_message(
     ]
     body = _render_list(items, today, show_dates=cutoff > today)
     if cutoff > today:
-        body = f"<b>Due by {_fmt_due(cutoff)}:</b>\n{body}"
+        body = f"<b>Due by {_fmt_due(cutoff, today)}:</b>\n{body}"
     if headline is not None:
         body = f"{headline}\n\n{body}"
     return _chunk(body), items
@@ -365,7 +372,7 @@ async def _send_list(
         if headline is not None:
             await _reply_html(update, headline)
         elif cutoff > today:
-            await _reply(update, f"Nothing due by {_fmt_due(cutoff)} 🎉")
+            await _reply(update, f"Nothing due by {_fmt_due(cutoff, today)} 🎉")
         else:
             await _reply(update, "Nothing due today 🎉")
         return
@@ -424,7 +431,7 @@ async def _edit_list(
     today = state.day
     rendered = _render_list(state.items, today, show_dates=state.cutoff > today)
     if state.cutoff > today:
-        rendered = f"<b>Due by {_fmt_due(state.cutoff)}:</b>\n{rendered}"
+        rendered = f"<b>Due by {_fmt_due(state.cutoff, today)}:</b>\n{rendered}"
     if state.headline is not None:
         rendered = f"{state.headline}\n\n{rendered}"
     if len(rendered) > _TELEGRAM_LIMIT:
@@ -578,7 +585,7 @@ def build_application(
             task = await todoist.add_task_in_project(text, project)
             today = cfg.today()
             day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
-            detail = f" (due {_fmt_due(day)})" if day is not None else ""
+            detail = f" (due {_fmt_due(day, today)})" if day is not None else ""
             headline = f"✅ Added: {_render_text(task.content)}{detail}"
             state = _get_state(context.chat_data)
             if state is not None and state.day != today:
@@ -689,7 +696,7 @@ def build_application(
                 await _reply_html(
                     update,
                     f"✅ {_render_text(item.text)} — "
-                    f"next occurrence: {_fmt_due(next_due)}",
+                    f"next occurrence: {_fmt_due(next_due, state.day)}",
                 )
             else:
                 await _reply_html(update, f"✅ {_render_text(item.text)}")

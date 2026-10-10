@@ -9,6 +9,7 @@ from todoist_api_python.models import Deadline, Due
 from iwcb_bot.bot import (
     _BODY_LIMIT,
     _chunk,
+    _fmt_due,
     _ListItem,
     _md_html,
     _NBSP,
@@ -430,6 +431,27 @@ class TestResolvedTimezone:
         cfg = _config()
         expected = datetime.now().astimezone().tzinfo
         assert cfg.resolved_timezone == expected
+
+
+class TestFmtDue:
+    _REF = date(2026, 10, 9)
+
+    def test_same_year_omits_year(self) -> None:
+        assert _fmt_due(date(2026, 6, 9), self._REF) == "Tue 9 Jun"
+
+    def test_same_day(self) -> None:
+        assert _fmt_due(self._REF, self._REF) == "Fri 9 Oct"
+
+    def test_earlier_year_includes_year(self) -> None:
+        assert _fmt_due(date(2025, 6, 9), self._REF) == "Mon 9 Jun 25"
+
+    def test_later_year_includes_year(self) -> None:
+        assert _fmt_due(date(2027, 1, 2), self._REF) == "Sat 2 Jan 27"
+
+    def test_year_boundary_reference(self) -> None:
+        # /week on 30 Dec reaches into January of the next year.
+        assert _fmt_due(date(2027, 1, 2), date(2026, 12, 30)) == "Sat 2 Jan 27"
+        assert _fmt_due(date(2026, 12, 31), date(2026, 12, 30)) == "Thu 31 Dec"
 
 
 class TestNextAnnounce:
