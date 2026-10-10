@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+from todoist_api_python.models import Deadline, Due
 
 from iwcb_bot.bot import (
     _BODY_LIMIT,
@@ -15,7 +16,7 @@ from iwcb_bot.bot import (
     _resolve_ids,
     _task_suffixes,
 )
-from iwcb_bot.todoist_client import _project_token
+from iwcb_bot.todoist_client import _project_token, effective_day
 
 TODAY = date(2026, 10, 9)
 
@@ -304,3 +305,45 @@ class TestProjectToken:
 
     def test_trailing_space_escaped(self) -> None:
         assert _project_token("Work ") == r"#Work\ "
+
+
+def _due(day: date) -> Due:
+    return Due.from_dict({"date": day.isoformat(), "string": day.isoformat()})
+
+
+def _deadline(day: date) -> Deadline:
+    return Deadline.from_dict({"date": day.isoformat()})
+
+
+class TestEffectiveDay:
+    def test_neither_due_nor_deadline(self) -> None:
+        assert effective_day(None, None) is None
+
+    def test_due_only(self) -> None:
+        assert effective_day(_due(date(2026, 10, 10)), None) == date(2026, 10, 10)
+
+    def test_deadline_only(self) -> None:
+        assert effective_day(None, _deadline(date(2026, 10, 10))) == date(2026, 10, 10)
+
+    def test_due_datetime_coerced(self) -> None:
+        due = Due.from_dict({"date": "2026-10-10T17:30:00", "string": "5pm"})
+        assert effective_day(due, None) == date(2026, 10, 10)
+
+    def test_deadline_datetime_coerced(self) -> None:
+        deadline = Deadline.from_dict({"date": "2026-10-10T17:30:00"})
+        assert effective_day(None, deadline) == date(2026, 10, 10)
+
+    def test_due_earlier_than_deadline(self) -> None:
+        assert effective_day(
+            _due(date(2026, 10, 9)), _deadline(date(2026, 10, 10))
+        ) == date(2026, 10, 9)
+
+    def test_deadline_earlier_than_due(self) -> None:
+        assert effective_day(
+            _due(date(2026, 10, 10)), _deadline(date(2026, 10, 9))
+        ) == date(2026, 10, 9)
+
+    def test_equal_days(self) -> None:
+        assert effective_day(
+            _due(date(2026, 10, 10)), _deadline(date(2026, 10, 10))
+        ) == date(2026, 10, 10)

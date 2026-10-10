@@ -7,7 +7,7 @@ from typing import TypeVar
 
 import requests
 from todoist_api_python.api_async import TodoistAPIAsync
-from todoist_api_python.models import Project, Task
+from todoist_api_python.models import Deadline, Due, Project, Task
 
 from .config import ConfigError
 
@@ -30,6 +30,26 @@ class TodoistAPIError(TodoistError):
 class DueTask:
     task: Task
     due: date
+
+
+def _day(value: date | datetime) -> date:
+    return value.date() if isinstance(value, datetime) else value
+
+
+def effective_day(due: Due | None, deadline: Deadline | None) -> date | None:
+    """The day a task counts for /today: the earlier of due date and deadline.
+
+    Deadlines are date-only hard limits that never recur; a task can have
+    both a due date and a deadline, and a passed deadline must not hide
+    behind a later due date, so the earlier of the two wins.  None only
+    when the task has neither.
+    """
+    days: list[date] = []
+    if due is not None:
+        days.append(_day(due.date))
+    if deadline is not None:
+        days.append(_day(deadline.date))
+    return min(days) if days else None
 
 
 class TodoistClient:
@@ -63,13 +83,10 @@ class TodoistClient:
         tasks = await self._pages(self._api.get_tasks(project_id=project_id, limit=200))
         due_tasks: list[DueTask] = []
         for task in tasks:
-            due = task.due
-            if due is None:
+            day = effective_day(task.due, task.deadline)
+            if day is None or day > today:
                 continue
-            day = due.date
-            day = day.date() if isinstance(day, datetime) else day
-            if day <= today:
-                due_tasks.append(DueTask(task=task, due=day))
+            due_tasks.append(DueTask(task=task, due=day))
         due_tasks.sort(key=lambda item: (item.due, item.task.content.casefold()))
         return due_tasks
 

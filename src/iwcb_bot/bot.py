@@ -24,7 +24,7 @@ from telegram.ext import (
 from todoist_api_python.models import Project
 
 from .config import Config
-from .todoist_client import DueTask, TodoistClient, TodoistError
+from .todoist_client import DueTask, TodoistClient, TodoistError, effective_day
 
 logger = logging.getLogger(__name__)
 
@@ -374,12 +374,8 @@ def build_application(
             return
         today = cfg.today()
         task = await todoist.add_task_in_project(text, project)
-        detail = ""
-        day: date | None = None
-        if task.due is not None:
-            raw_day = task.due.date
-            day = raw_day.date() if isinstance(raw_day, datetime) else raw_day
-            detail = f" (due {_fmt_due(day)})"
+        day = effective_day(task.due, task.deadline)
+        detail = f" (due {_fmt_due(day)})" if day is not None else ""
         headline = f"✅ Added: {_render_text(task.content)}{detail}"
         if day is None or day > today:
             await _reply_html(update, headline)
