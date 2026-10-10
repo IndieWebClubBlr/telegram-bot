@@ -373,7 +373,7 @@ def build_application(
             )
             return
         today = cfg.today()
-        task = await todoist.add_task_in_project(text, project.id)
+        task = await todoist.add_task_in_project(text, project)
         detail = ""
         day: date | None = None
         if task.due is not None:

@@ -73,12 +73,16 @@ class TodoistClient:
         due_tasks.sort(key=lambda item: (item.due, item.task.content.casefold()))
         return due_tasks
 
-    async def add_task_in_project(self, text: str, project_id: str) -> Task:
-        task = await self._run(self._api.add_task_quick(text))
-        if task.project_id == project_id:
+    async def add_task_in_project(self, text: str, project: Project) -> Task:
+        # Quick-add only resolves /Section and +Assignee when the text
+        # itself names a project, so prepend the configured project
+        # token (before any trailing // description in the text).
+        quick_text = f"{_project_token(project.name)} {text}"
+        task = await self._run(self._api.add_task_quick(quick_text))
+        if task.project_id == project.id:
             return task
         try:
-            await self._run(self._api.move_task(task.id, project_id=project_id))
+            await self._run(self._api.move_task(task.id, project_id=project.id))
         except TodoistError:
             # Don't leave a stray Inbox task behind a reported failure:
             # roll back best-effort, then surface the original error.
@@ -121,6 +125,11 @@ class TodoistClient:
             raise _api_error(exc) from exc
         except requests.exceptions.RequestException as exc:
             raise TodoistError("Could not reach the Todoist API") from exc
+
+
+def _project_token(name: str) -> str:
+    """Quick-add project token for a project name, e.g. #My\\ Project."""
+    return "#" + name.replace("\\", "\\\\").replace(" ", "\\ ")
 
 
 def _api_error(exc: requests.exceptions.HTTPError) -> TodoistAPIError:

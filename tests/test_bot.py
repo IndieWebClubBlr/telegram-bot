@@ -15,6 +15,7 @@ from iwcb_bot.bot import (
     _resolve_ids,
     _task_suffixes,
 )
+from iwcb_bot.todoist_client import _project_token
 
 TODAY = date(2026, 10, 9)
 
@@ -283,3 +284,23 @@ class TestRenderToday:
             assert line.count("<s>") == line.count("</s>")
             assert line.count("<a ") == line.count("</a>")
             assert line.count("<code>") == line.count("</code>")
+
+
+class TestProjectToken:
+    def test_plain_name(self) -> None:
+        assert _project_token("Work") == "#Work"
+
+    def test_leading_hash_in_name_not_special_cased(self) -> None:
+        assert _project_token("#Work") == "##Work"
+
+    def test_spaces_escaped(self) -> None:
+        assert _project_token("My Project") == r"#My\ Project"
+
+    def test_multiple_spaces_escaped(self) -> None:
+        assert _project_token("My  Project") == r"#My\ \ Project"
+
+    def test_backslash_escaped_before_spaces(self) -> None:
+        assert _project_token("a\\b c") == r"#a\\b\ c"
+
+    def test_trailing_space_escaped(self) -> None:
+        assert _project_token("Work ") == r"#Work\ "
