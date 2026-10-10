@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from markdown_it import MarkdownIt
@@ -47,13 +47,16 @@ Commands (project: {project}):
 
 /add <text> — add a task, quick-add syntax: "buy milk tomorrow p1 @errand"
 /today — tasks due today or overdue, each with a short id
-/done <id> — complete the task with that id
+/tomorrow — tasks due by end of tomorrow
+/week — tasks due by end of the next 6 days
+/done <id> — complete the task with that id (from the last shown list)
 /undo <id> — reopen a task completed via /done (not recurring)
-/edit <id> <new text> — edit a task with that id
+/edit <id> <new text> — edit the task with that id
 /project — link to this project in Todoist
 /help — this message
 
 ids are shown in lowercase and matched case-insensitively
+/today, /tomorrow and /week show the list that /done, /undo and /edit act on
 """
 
 
@@ -223,6 +226,7 @@ class _ListItem:
 class _ListState:
     message_id: int | None
     day: date
+    cutoff: date
     items: list[_ListItem]
 
 
@@ -245,10 +249,17 @@ def _task_suffixes(task_ids: list[str]) -> list[str]:
     return suffixes
 
 
-def _render_today(project_name: str, items: list[_ListItem], today: date) -> str:
+def _render_list(items: list[_ListItem], today: date, *, show_dates: bool) -> str:
+    """Render the task list body (no headline).
+
+    With show_dates (used by /tomorrow and /week) every line carries its
+    due date so multi-day lists are readable; /today only dates overdue
+    lines.  Done items keep their date in multi-day lists too — the
+    strike-through already marks them.
+    """
     suffixes = _task_suffixes([item.task_id for item in items])
     width = max((len(suffix) for suffix in suffixes), default=0)
-    lines = [f"<b>Due in {html.escape(_one_line(project_name))}:</b>"]
+    lines: list[str] = []
     for suffix, item in zip(suffixes, items, strict=True):
         marker = "⚠ " if item.due < today else ""
         body = _render_text(item.text)
@@ -256,23 +267,23 @@ def _render_today(project_name: str, items: list[_ListItem], today: date) -> str
             body = f"<s>{body}</s>"
         padded = suffix.ljust(width, _NBSP)
         line = f"<code>{html.escape(padded)}</code>  {marker}{body}"
-        if item.due < today and not item.done:
+        if show_dates or (item.due < today and not item.done):
             line += f" — due {_fmt_due(item.due)}"
         lines.append(line)
     return "\n".join(lines)
 
 
-async def _send_today_list(
+async def _send_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    project_name: str,
     tasks: list[DueTask],
     today: date,
+    cutoff: date,
     headline: str | None = None,
 ) -> None:
     """Send the rendered list, optionally under an HTML headline line.
 
-    Stores the list state so /done can strike items in place.
+    Stores the list state so /done, /undo and /edit act on it.
     """
     message = update.effective_message
     if message is None:
@@ -281,6 +292,8 @@ async def _send_today_list(
         _set_state(context, None)
         if headline is not None:
             await _reply_html(update, headline)
+        elif cutoff > today:
+            await _reply(update, f"Nothing due by {_fmt_due(cutoff)} 🎉")
         else:
             await _reply(update, "Nothing due today 🎉")
         return
@@ -293,22 +306,27 @@ async def _send_today_list(
         )
         for task in tasks
     ]
-    rendered = _render_today(project_name, items, today)
+    body = _render_list(items, today, show_dates=cutoff > today)
+    if cutoff > today:
+        body = f"<b>Due by {_fmt_due(cutoff)}:</b>\n{body}"
     if headline is not None:
-        rendered = f"{headline}\n\n{rendered}"
-    chunks = _chunk(rendered)
+        body = f"{headline}\n\n{body}"
+    chunks = _chunk(body)
     first = await message.reply_text(chunks[0], parse_mode=ParseMode.HTML)
     message_id = first.message_id if len(chunks) == 1 else None
     for chunk in chunks[1:]:
         await message.reply_text(chunk, parse_mode=ParseMode.HTML)
-    _set_state(context, _ListState(message_id=message_id, day=today, items=items))
+    _set_state(
+        context,
+        _ListState(message_id=message_id, day=today, cutoff=cutoff, items=items),
+    )
 
 
 def _get_state(context: ContextTypes.DEFAULT_TYPE) -> _ListState | None:
     chat_data = context.chat_data
     if chat_data is None:
         return None
-    state = chat_data.get("today")
+    state = chat_data.get("list")
     return state if isinstance(state, _ListState) else None
 
 
@@ -317,15 +335,14 @@ def _set_state(context: ContextTypes.DEFAULT_TYPE, state: _ListState | None) -> 
     if chat_data is None:
         return
     if state is None:
-        chat_data.pop("today", None)
+        chat_data.pop("list", None)
     else:
-        chat_data["today"] = state
+        chat_data["list"] = state
 
 
 async def _edit_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    project_name: str,
     state: _ListState,
     today: date,
 ) -> None:
@@ -334,9 +351,11 @@ async def _edit_list(
     chat = update.effective_chat
     if chat is None:
         return
-    rendered = _render_today(project_name, state.items, today)
+    rendered = _render_list(state.items, today, show_dates=state.cutoff > today)
+    if state.cutoff > today:
+        rendered = f"<b>Due by {_fmt_due(state.cutoff)}:</b>\n{rendered}"
     if len(rendered) > _TELEGRAM_LIMIT:
-        logger.warning("rendered /today list is %d chars, skipping edit", len(rendered))
+        logger.warning("rendered list is %d chars, skipping edit", len(rendered))
         return
     try:
         await context.bot.edit_message_text(
@@ -347,11 +366,11 @@ async def _edit_list(
         )
     except BadRequest as exc:
         if "not modified" in str(exc):
-            logger.debug("/today message already up to date")
+            logger.debug("list message already up to date")
         else:
-            logger.exception("could not edit /today message")
+            logger.exception("could not edit list message")
     except TelegramError:
-        logger.exception("could not edit /today message")
+        logger.exception("could not edit list message")
 
 
 def build_application(
@@ -377,33 +396,58 @@ def build_application(
         day = effective_day(task.due, task.deadline)
         detail = f" (due {_fmt_due(day)})" if day is not None else ""
         headline = f"✅ Added: {_render_text(task.content)}{detail}"
-        if day is None or day > today:
+        state = _get_state(context)
+        if state is not None and state.day != today:
+            state = None
+        cutoff = state.cutoff if state is not None else today
+        if day is None or day > cutoff:
             await _reply_html(update, headline)
             return
-        tasks = await todoist.today_tasks(project.id, today)
-        await _send_today_list(
-            update, context, project.name, tasks, today, headline=headline
-        )
+        tasks = await todoist.tasks_due_by(project.id, cutoff)
+        await _send_list(update, context, tasks, today, cutoff, headline=headline)
 
-    async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    def _cmd_list(days: int) -> Handler:
+        async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            today = cfg.today()
+            cutoff = today + timedelta(days=days)
+            tasks = await todoist.tasks_due_by(project.id, cutoff)
+            await _send_list(update, context, tasks, today, cutoff)
+
+        return guarded(cmd, typing=True)
+
+    async def _require_state(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> _ListState | None:
+        """State of today's last shown list, or a reply explaining why not."""
         today = cfg.today()
-        tasks = await todoist.today_tasks(project.id, today)
-        await _send_today_list(update, context, project.name, tasks, today)
+        state = _get_state(context)
+        if state is None:
+            await _reply(update, "Send /today, /tomorrow or /week first")
+            return None
+        if state.day != today:
+            _set_state(context, None)
+            await _reply(
+                update,
+                "The last list is from a previous day — "
+                "send /today, /tomorrow or /week",
+            )
+            return None
+        return state
 
     async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = " ".join(context.args or []).strip()
         if not query:
-            await _reply(update, "Usage: /done <id> — id shown by /today")
-            return
-        today = cfg.today()
-        tasks = await todoist.today_tasks(project.id, today)
-        folded = query.casefold()
-        resolved = _resolve_ids([task.task.id for task in tasks], folded)
-        if not resolved:
             await _reply(
-                update,
-                "No match — completed or changed elsewhere. Send /today to refresh",
+                update, "Usage: /done <id> — id shown by /today, /tomorrow or /week"
             )
+            return
+        state = await _require_state(update, context)
+        if state is None:
+            return
+        folded = query.casefold()
+        resolved = _resolve_ids([item.task_id for item in state.items], folded)
+        if not resolved:
+            await _reply(update, "No match in the last shown list")
             return
         if len(resolved) > 1:
             await _reply(
@@ -411,54 +455,41 @@ def build_application(
                 f"Ambiguous — matches {len(resolved)} tasks, be more specific",
             )
             return
-        match = next(task for task in tasks if task.task.id == resolved[0])
-        recurring = bool(match.task.due and match.task.due.is_recurring)
-        await todoist.complete_task(match.task.id)
+        item = next(item for item in state.items if item.task_id == resolved[0])
+        try:
+            await todoist.complete_task(item.task_id)
+        except TodoistError as exc:
+            await _reply(update, f"⚠ {exc} — send /today to refresh")
+            return
         next_due: date | None = None
-        if recurring:
+        if item.recurring:
             try:
-                rolled = await todoist.get_task(match.task.id)
+                rolled = await todoist.get_task(item.task_id)
                 if rolled.due is not None:
                     day = rolled.due.date
                     next_due = day.date() if isinstance(day, datetime) else day
             except TodoistError:
-                logger.warning("could not read next occurrence of %s", match.task.id)
-        state = _get_state(context)
-        if state is not None and state.day != today:
-            # Stale (previous-day) list: don't mutate or edit it; /undo
-            # will ask for a fresh /today instead of lying.
-            _set_state(context, None)
-            state = None
-        if state is not None:
-            for item in state.items:
-                if item.task_id == match.task.id:
-                    item.done = True
-                    item.text = match.task.content
-                    item.due = match.due
-                    item.recurring = recurring
-                    break
-            await _edit_list(update, context, project.name, state, today)
-        if recurring and next_due is not None:
+                logger.warning("could not read next occurrence of %s", item.task_id)
+        item.done = True
+        await _edit_list(update, context, state, cfg.today())
+        if item.recurring and next_due is not None:
             await _reply_html(
                 update,
-                f"✅ {_render_text(match.task.content)} — "
+                f"✅ {_render_text(item.text)} — "
                 f"next occurrence: {_fmt_due(next_due)}",
             )
         else:
-            await _reply_html(update, f"✅ {_render_text(match.task.content)}")
+            await _reply_html(update, f"✅ {_render_text(item.text)}")
 
     async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = " ".join(context.args or []).strip()
         if not query:
-            await _reply(update, "Usage: /undo <id> — id shown by /today")
+            await _reply(
+                update, "Usage: /undo <id> — id shown by /today, /tomorrow or /week"
+            )
             return
-        today = cfg.today()
-        state = _get_state(context)
+        state = await _require_state(update, context)
         if state is None:
-            await _reply(update, "Send /today first")
-            return
-        if state.day != today:
-            await _reply(update, "The /today list is from a previous day — send /today")
             return
         folded = query.casefold()
         resolved = _resolve_ids([item.task_id for item in state.items], folded)
@@ -469,7 +500,7 @@ def build_application(
             )
             return
         if not resolved:
-            await _reply(update, "No match in the last /today list")
+            await _reply(update, "No match in the last shown list")
             return
         item = next(item for item in state.items if item.task_id == resolved[0])
         if not item.done:
@@ -484,7 +515,7 @@ def build_application(
             await _reply(update, f"⚠ {exc} — send /today to refresh")
             return
         item.done = False
-        await _edit_list(update, context, project.name, state, today)
+        await _edit_list(update, context, state, cfg.today())
         await _reply_html(update, f"↩️ {_render_text(item.text)}")
 
     async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -500,15 +531,13 @@ def build_application(
         if len(new_text) > 500:
             await _reply(update, "Task text too long — max 500 characters")
             return
-        today = cfg.today()
-        tasks = await todoist.today_tasks(project.id, today)
+        state = await _require_state(update, context)
+        if state is None:
+            return
         folded = query.casefold()
-        resolved = _resolve_ids([task.task.id for task in tasks], folded)
+        resolved = _resolve_ids([item.task_id for item in state.items], folded)
         if not resolved:
-            await _reply(
-                update,
-                "No match — completed or changed elsewhere. Send /today to refresh",
-            )
+            await _reply(update, "No match in the last shown list")
             return
         if len(resolved) > 1:
             await _reply(
@@ -516,21 +545,14 @@ def build_application(
                 f"Ambiguous — matches {len(resolved)} tasks, be more specific",
             )
             return
-        match = next(task for task in tasks if task.task.id == resolved[0])
-        await todoist.update_task_content(match.task.id, new_text)
-        state = _get_state(context)
-        if state is not None and state.day != today:
-            _set_state(context, None)
-            state = None
-        if state is not None:
-            found = False
-            for item in state.items:
-                if item.task_id == match.task.id:
-                    item.text = new_text
-                    found = True
-                    break
-            if found:
-                await _edit_list(update, context, project.name, state, today)
+        item = next(item for item in state.items if item.task_id == resolved[0])
+        try:
+            await todoist.update_task_content(item.task_id, new_text)
+        except TodoistError as exc:
+            await _reply(update, f"⚠ {exc} — send /today to refresh")
+            return
+        item.text = new_text
+        await _edit_list(update, context, state, cfg.today())
         await _reply_html(update, f"✏️ {_render_text(new_text)}")
 
     async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -576,9 +598,9 @@ def build_application(
     application.add_handler(
         CommandHandler("add", guarded(cmd_add, typing=True), filters=auth)
     )
-    application.add_handler(
-        CommandHandler("today", guarded(cmd_today, typing=True), filters=auth)
-    )
+    application.add_handler(CommandHandler("today", _cmd_list(0), filters=auth))
+    application.add_handler(CommandHandler("tomorrow", _cmd_list(1), filters=auth))
+    application.add_handler(CommandHandler("week", _cmd_list(6), filters=auth))
     application.add_handler(
         CommandHandler("done", guarded(cmd_done, typing=True), filters=auth)
     )

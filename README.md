@@ -12,11 +12,13 @@ All commands operate on the configured project only.
 | Command | What it does |
 | --- | --- |
 | `/help` (alias `/start`) | Command list |
-| `/add <text>` | Add a task using Todoist [quick-add syntax](https://developer.todoist.com/api/v1/#operation/quick_add_api_v1_tasks_quick_post): `/add buy milk tomorrow p1 @errand /Groceries +Abhinav`. Sections (`/Name`) and assignees (`+Name`) work because the configured project is auto-prepended to the quick-add text; a `#OtherProject` in the text is overridden — the configured project always wins. If the new task is due today, overdue, or deadline-due today, the reply also contains the refreshed task list — IDs shown by an earlier `/today` may have shifted |
+| `/add <text>` | Add a task using Todoist [quick-add syntax](https://developer.todoist.com/api/v1/#operation/quick_add_api_v1_tasks_quick_post): `/add buy milk tomorrow p1 @errand /Groceries +Abhinav`. Sections (`/Name`) and assignees (`+Name`) work because the configured project is auto-prepended to the quick-add text; a `#OtherProject` in the text is overridden — the configured project always wins. If the new task falls within the last shown list's window, the reply also contains that list refreshed — IDs shown earlier may have shifted |
 | `/today` | Tasks in the project due today or overdue (⚠), sorted by due date; deadlines count as due dates (the earlier of the two wins when a task has both). Each line starts with a short unique ID, shown in lowercase; overdue lines also end with `— due <date>` |
-| `/done <id>` | Complete the task whose ID ends with `<id>` (as shown by /today; matching is case-insensitive). Resolved against a fresh fetch, so a task completed elsewhere gives a safe "no match" error. Strikes the line in place (lists that fit a single message) and confirms; for a recurring task the confirmation includes the next occurrence date |
-| `/undo <id>` | Reopen a task completed with `/done`, un-striking it. Refuses recurring tasks — completing one rolls it to its next occurrence |
-| `/edit <id> <new text>` | Edit the task whose ID ends with `<id>`, resolved against a fresh fetch like `/done`. The text is stored verbatim — quick-add parsing (dates, `p1`, `@labels`) happens only on creation (`/add`), so those tokens become part of the task name. Recurring: the new name applies to all occurrences. Max 500 characters |
+| `/tomorrow` | Everything `/today` shows plus tasks due tomorrow; header `Due by <tomorrow>:`, every line carries its due date |
+| `/week` | Cumulative through end of today + 6 days (7 calendar days including today); header `Due by <date>:`, every line carries its due date |
+| `/done <id>` | Complete the task whose ID ends with `<id>` from the last shown list (`/today`, `/tomorrow` or `/week`; matching is case-insensitive). Strikes the line in place (lists that fit a single message) and confirms; for a recurring task the confirmation includes the next occurrence date. Stale data (task changed elsewhere) gives a safe error |
+| `/undo <id>` | Reopen a task completed with `/done` from the last shown list, un-striking it. Refuses recurring tasks — completing one rolls it to its next occurrence |
+| `/edit <id> <new text>` | Edit the task whose ID ends with `<id>` from the last shown list. The text is stored verbatim — quick-add parsing (dates, `p1`, `@labels`) happens only on creation (`/add`), so those tokens become part of the task name. Recurring: the new name applies to all occurrences. Max 500 characters |
 | `/project` | Link to the configured project in Todoist |
 
 Only chats listed in `ALLOWED_CHAT_IDS` are served; everyone else is ignored.
@@ -26,21 +28,22 @@ does not re-run it. Unknown commands get a short reply pointing at `/help`;
 commands addressed to other bots (`/cmd@OtherBot`) are ignored.
 
 Task text is markdown (that's how Todoist stores it): links, **bold**,
-*italic*, ~~strike~~, `code` and bare URLs are rendered in `/today` lines and
+*italic*, ~~strike~~, `code` and bare URLs are rendered in list lines and
 in `/add`, `/done`, `/undo` and `/edit` replies.
 
-The bot keeps all state in memory: a restart loses the saved `/today` list, so
-`/undo` needs a fresh `/today` first — `/done` re-fetches and keeps working
-after a restart. Each `/today` (and each `/add` list-refresh) replaces the
-saved list, which closes the `/undo` window for tasks completed before it.
+The bot keeps all state in memory: a restart loses the saved list, so `/done`,
+`/undo` and `/edit` need a fresh `/today`, `/tomorrow` or `/week` first. Each
+list command (and each `/add` list-refresh) replaces the saved list, which
+closes the `/undo` window for tasks completed before it. A list from a previous
+day is discarded — the bot asks for a fresh one instead of acting on stale IDs.
 
 Recurring tasks: completing one never leaves Todoist's completed state — the
 same task stays active, just rolled to its next date. `/undo` therefore
 refuses them instead of reporting a false success; bring the occurrence back
 by rescheduling in Todoist.
 
-While a command is talking to Todoist (`/add`, `/today`, `/done`, `/undo`,
-`/edit`), Telegram shows the bot typing until the reply arrives.
+While a command is talking to Todoist (`/add`, `/today`, `/tomorrow`, `/week`,
+`/done`, `/undo`, `/edit`), Telegram shows the bot typing until the reply arrives.
 
 ## Configuration
 

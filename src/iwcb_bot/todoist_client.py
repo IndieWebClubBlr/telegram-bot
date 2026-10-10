@@ -79,12 +79,12 @@ class TodoistClient:
         except TodoistError as exc:
             raise TodoistError(f"could not load project {project_id!r}: {exc}") from exc
 
-    async def today_tasks(self, project_id: str, today: date) -> list[DueTask]:
+    async def tasks_due_by(self, project_id: str, cutoff: date) -> list[DueTask]:
         tasks = await self._pages(self._api.get_tasks(project_id=project_id, limit=200))
         due_tasks: list[DueTask] = []
         for task in tasks:
             day = effective_day(task.due, task.deadline)
-            if day is None or day > today:
+            if day is None or day > cutoff:
                 continue
             due_tasks.append(DueTask(task=task, due=day))
         due_tasks.sort(key=lambda item: (item.due, item.task.content.casefold()))
