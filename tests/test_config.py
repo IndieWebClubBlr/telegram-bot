@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -75,6 +75,35 @@ class TestTimezone:
         cfg = make_config(TIMEZONE="Asia/Kolkata")
         expected = datetime.now(tz=ZoneInfo("Asia/Kolkata")).date()
         assert cfg.today() == expected
+
+
+class TestMorningAnnounceTime:
+    def test_unset_defaults_to_9am(self) -> None:
+        assert make_config().morning_announce_time == time(9, 0)
+
+    def test_empty_defaults_to_9am(self) -> None:
+        assert make_config(MORNING_ANNOUNCE_TIME="  ").morning_announce_time == time(
+            9, 0
+        )
+
+    def test_hh_mm_parsed(self) -> None:
+        cfg = make_config(MORNING_ANNOUNCE_TIME="08:30")
+        assert cfg.morning_announce_time == time(8, 30)
+
+    def test_unpadded_parsed(self) -> None:
+        cfg = make_config(MORNING_ANNOUNCE_TIME="9:05")
+        assert cfg.morning_announce_time == time(9, 5)
+
+    def test_off_disables(self) -> None:
+        assert make_config(MORNING_ANNOUNCE_TIME="off").morning_announce_time is None
+
+    def test_off_case_insensitive(self) -> None:
+        assert make_config(MORNING_ANNOUNCE_TIME="OFF").morning_announce_time is None
+
+    @pytest.mark.parametrize("raw", ["25:00", "9am", "09-00", "12:61", ":30", "9:"])
+    def test_invalid_rejected(self, raw: str) -> None:
+        with pytest.raises(ConfigError, match="MORNING_ANNOUNCE_TIME"):
+            make_config(MORNING_ANNOUNCE_TIME=raw)
 
 
 class TestSecrets:

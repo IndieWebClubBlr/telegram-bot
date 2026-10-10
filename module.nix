@@ -18,6 +18,7 @@ let
     ''
       TODOIST_PROJECT_ID=${cfg.projectId}
       ALLOWED_CHAT_IDS=${lib.concatMapStringsSep "," toString cfg.allowedChatIds}
+      MORNING_ANNOUNCE_TIME=${cfg.morningAnnounceTime}
     ''
     + lib.optionalString (cfg.timeZone != null) "TIMEZONE=${cfg.timeZone}\n"
   );
@@ -64,6 +65,20 @@ in
         different time zones, so this should usually be the users'
         time zone rather than the server's. When null, the bot falls
         back to the server's local time zone.
+      '';
+    };
+
+    morningAnnounceTime = lib.mkOption {
+      type = lib.types.strMatching "(([01][0-9]|2[0-3]):[0-5][0-9]|off)";
+      default = "09:00";
+      example = "08:30";
+      description = ''
+        Wall-clock time (HH:MM, in the time zone above) at which the
+        bot proactively sends the day's task list to every allowed
+        chat (MORNING_ANNOUNCE_TIME). The sent list is actionable —
+        /done, /undo and /edit work on it immediately. Set to "off"
+        to disable the daily announcement. If the bot is down at the
+        scheduled time, the list is not re-sent until the next day.
       '';
     };
 

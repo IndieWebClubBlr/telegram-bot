@@ -45,6 +45,18 @@ by rescheduling in Todoist.
 While a command is talking to Todoist (`/add`, `/today`, `/tomorrow`, `/week`,
 `/done`, `/undo`, `/edit`), Telegram shows the bot typing until the reply arrives.
 
+## Daily morning list
+
+Unless disabled with `MORNING_ANNOUNCE_TIME=off`, the bot proactively sends
+the day's task list (same rendering as `/today`) to every allowed chat at the
+configured wall-clock time (default 09:00) in the `TIMEZONE` zone. The sent
+list becomes that chat's last shown list — `/done`, `/undo` and `/edit` work
+on it immediately, no fresh `/today` needed. In forum groups the message lands
+in the General topic (commands still answer in their own topic). An empty day
+gets "Nothing due today 🎉"; a Todoist failure is reported in-chat so silence
+is never mistaken for "nothing due". If the bot is down at the scheduled time,
+the list is not re-sent until the next day.
+
 ## Configuration
 
 Four variables are required — the bot exits with a clear error if any is
@@ -58,6 +70,7 @@ errors) — plus one optional:
 | `TODOIST_PROJECT_ID` | Project ID: the part after the last dash of the project URL, `https://app.todoist.com/app/project/<name-slug>-<id>` (e.g. `6X4Vw2Hfmg73Q2XR`). Loaded once at startup; a bad ID aborts startup with exit code 2 |
 | `ALLOWED_CHAT_IDS` | Comma-separated Telegram chat IDs allowed to use the bot. Group IDs are negative (e.g. `-1001234567890`) — learn one by forwarding a group message to an ID-reporting bot such as [@getidsbot](https://t.me/getidsbot) |
 | `TIMEZONE` | Optional IANA time zone for the bot's "today" calculations (e.g. `Asia/Kolkata`). The server and the bot's users are often in different time zones, so set this explicitly; an invalid value aborts startup with exit code 2. Falls back to the server's local time zone. Naive due datetimes (the normal Todoist shape) are taken as wall-clock times in this zone; timezone-aware dues are converted into it before the calendar day is taken |
+| `MORNING_ANNOUNCE_TIME` | Optional wall-clock time (24h `HH:MM`, in the `TIMEZONE` zone) at which the bot proactively sends the day's task list to every allowed chat. Defaults to `09:00`; set to `off` to disable. An invalid value aborts startup with exit code 2 |
 
 ## Local development
 

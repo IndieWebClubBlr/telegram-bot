@@ -4,10 +4,11 @@ import asyncio
 import functools
 import html
 import logging
-from collections.abc import Callable, Coroutine
+from collections import defaultdict
+from collections.abc import Callable, Coroutine, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, tzinfo
 from typing import Any
 
 from markdown_it import MarkdownIt
@@ -38,10 +39,44 @@ _TYPING_INTERVAL = 4.0
 _NBSP = "\N{NO-BREAK SPACE}"
 _LIST_CMDS = "/today, /tomorrow or /week"
 
+# Every read-modify-write of a chat's list state holds this chat's lock:
+# updates are processed sequentially, so the only concurrent writer is
+# the morning-announce loop.  Locks bind to the running event loop on
+# first use; the bot runs a single loop for its whole lifetime.
+_chat_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def _chat_lock(chat_id: int) -> asyncio.Lock:
+    return _chat_locks[chat_id]
+
+
 _md = MarkdownIt("gfm-like", {"html": False}).disable("image")
 # Telegram only accepts http(s) and tg links; markdown-it's default
 # validator would also emit mailto:, data: and relative hrefs.
 _md.validateLink = lambda url: url.startswith(("http://", "https://", "tg://"))
+
+
+def _next_announce(at: time, tz: tzinfo, now: datetime | None = None) -> datetime:
+    """The next `at` wall-clock occurrence in `tz`, strictly after `now`.
+
+    Returns the target instant (not a delta): the caller sleeps the
+    timestamp difference (absolute time — DST-correct) and fires
+    unconditionally on wake, because asyncio.sleep lands at or after
+    the deadline and a re-derivation at the target would always roll
+    to tomorrow.  At or after the moment the next occurrence is
+    tomorrow (no catch-up — a bot that was down at the scheduled time
+    stays quiet until the next morning).  `now` is injectable for
+    tests; it must be aware.
+    """
+    if now is None:
+        now = datetime.now(tz)
+    else:
+        now = now.astimezone(tz)
+    target = datetime.combine(now.date(), at, tzinfo=tz)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
 
 _HELP = """\
 Commands (project: {project}):
@@ -279,6 +314,36 @@ def _render_list(items: list[_ListItem], today: date, *, show_dates: bool) -> st
     return "\n".join(lines)
 
 
+def _render_list_message(
+    tasks: list[DueTask],
+    today: date,
+    cutoff: date,
+    headline: str | None = None,
+) -> tuple[list[str], list[_ListItem]]:
+    """Render tasks into sendable chunks plus the state items.
+
+    Returns ([], []) for an empty list — the caller decides the empty
+    reply (handlers and the morning loop word it slightly differently).
+    """
+    if not tasks:
+        return [], []
+    items = [
+        _ListItem(
+            task_id=task.task.id,
+            text=task.task.content,
+            due=task.due,
+            recurring=bool(task.task.due and task.task.due.is_recurring),
+        )
+        for task in tasks
+    ]
+    body = _render_list(items, today, show_dates=cutoff > today)
+    if cutoff > today:
+        body = f"<b>Due by {_fmt_due(cutoff)}:</b>\n{body}"
+    if headline is not None:
+        body = f"{headline}\n\n{body}"
+    return _chunk(body), items
+
+
 async def _send_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -294,8 +359,9 @@ async def _send_list(
     message = update.effective_message
     if message is None:
         return
-    if not tasks:
-        _set_state(context, None)
+    chunks, items = _render_list_message(tasks, today, cutoff, headline)
+    if not chunks:
+        _set_state(context.chat_data, None)
         if headline is not None:
             await _reply_html(update, headline)
         elif cutoff > today:
@@ -303,27 +369,12 @@ async def _send_list(
         else:
             await _reply(update, "Nothing due today 🎉")
         return
-    items = [
-        _ListItem(
-            task_id=task.task.id,
-            text=task.task.content,
-            due=task.due,
-            recurring=bool(task.task.due and task.task.due.is_recurring),
-        )
-        for task in tasks
-    ]
-    body = _render_list(items, today, show_dates=cutoff > today)
-    if cutoff > today:
-        body = f"<b>Due by {_fmt_due(cutoff)}:</b>\n{body}"
-    if headline is not None:
-        body = f"{headline}\n\n{body}"
-    chunks = _chunk(body)
     first = await message.reply_text(chunks[0], parse_mode=ParseMode.HTML)
     message_id = first.message_id if len(chunks) == 1 else None
     for chunk in chunks[1:]:
         await message.reply_text(chunk, parse_mode=ParseMode.HTML)
     _set_state(
-        context,
+        context.chat_data,
         _ListState(
             message_id=message_id,
             day=today,
@@ -334,16 +385,18 @@ async def _send_list(
     )
 
 
-def _get_state(context: ContextTypes.DEFAULT_TYPE) -> _ListState | None:
-    chat_data = context.chat_data
+def _get_state(
+    chat_data: MutableMapping[str, Any] | None,
+) -> _ListState | None:
     if chat_data is None:
         return None
     state = chat_data.get("list")
     return state if isinstance(state, _ListState) else None
 
 
-def _set_state(context: ContextTypes.DEFAULT_TYPE, state: _ListState | None) -> None:
-    chat_data = context.chat_data
+def _set_state(
+    chat_data: MutableMapping[str, Any] | None, state: _ListState | None
+) -> None:
     if chat_data is None:
         return
     if state is None:
@@ -398,15 +451,108 @@ async def _edit_list(
         logger.exception("could not edit list message")
 
 
+async def _send_morning_list(
+    application: Application,
+    chat_id: int,
+    tasks: list[DueTask],
+    today: date,
+    cutoff: date,
+) -> None:
+    """Send the morning list to one chat and store it as that chat's state.
+
+    Same rendering as /today; the message becomes the last shown list,
+    so /done, /undo and /edit work on it immediately.  Sent to the chat
+    root (no message_thread_id → the General topic in forum groups).
+    Caller holds the chat lock.
+    """
+    chat_data = application.chat_data[chat_id]
+    chunks, items = _render_list_message(tasks, today, cutoff)
+    if not chunks:
+        _set_state(chat_data, None)
+        await application.bot.send_message(chat_id=chat_id, text="Nothing due today 🎉")
+        return
+    first = await application.bot.send_message(
+        chat_id=chat_id, text=chunks[0], parse_mode=ParseMode.HTML
+    )
+    message_id = first.message_id if len(chunks) == 1 else None
+    for chunk in chunks[1:]:
+        await application.bot.send_message(
+            chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML
+        )
+    _set_state(
+        chat_data,
+        _ListState(
+            message_id=message_id,
+            day=today,
+            cutoff=cutoff,
+            items=items,
+            headline=None,
+        ),
+    )
+
+
+async def _morning_loop(
+    cfg: Config, project: Project, todoist: TodoistClient, application: Application
+) -> None:
+    """Send the day's list to every allowed chat at the configured time.
+
+    Started by post_init only when morning_announce_time is set; the
+    task is cancelled by post_stop.  Each cycle sleeps until the next
+    wall-clock target (timestamp math — DST-correct) and then fires
+    unconditionally: asyncio.sleep lands at or after the deadline, so
+    re-deriving at wake would always roll to tomorrow and never send.
+    The Todoist fetch is chat-independent and runs once per cycle,
+    outside any chat lock; only the send and state write are locked.
+    An unexpected error in one cycle is logged and the schedule
+    continues; a fetch failure notifies each chat so silence is never
+    mistaken for "nothing due".
+    """
+    at = cfg.morning_announce_time
+    if at is None:
+        return
+    tz = cfg.resolved_timezone
+    logger.info("morning list scheduled daily at %s (%s)", at.strftime("%H:%M"), tz)
+    while True:
+        target = _next_announce(at, tz)
+        await asyncio.sleep(max(0.0, target.timestamp() - datetime.now(tz).timestamp()))
+        try:
+            today = cfg.today()
+            try:
+                tasks = await todoist.tasks_due_by(project.id, cutoff=today)
+            except TodoistError:
+                logger.warning("morning fetch failed")
+                tasks = None
+            for chat_id in sorted(cfg.allowed_chat_ids):
+                async with _chat_lock(chat_id):
+                    try:
+                        if tasks is None:
+                            with suppress(TelegramError):
+                                await application.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="⚠ couldn't fetch today's tasks — try /today",
+                                )
+                        else:
+                            await _send_morning_list(
+                                application, chat_id, tasks, today, today
+                            )
+                    except TelegramError:
+                        logger.warning("morning send failed for chat %s", chat_id)
+        except Exception:
+            # Never let an unexpected error (bug, closed client at
+            # shutdown) kill the schedule; CancelledError is a
+            # BaseException and propagates for clean shutdown.
+            logger.exception("morning announce cycle failed")
+
+
 def build_application(
     cfg: Config, project: Project, todoist: TodoistClient
 ) -> Application:
     # NOTE: the Application is built without concurrent_updates, so PTB
     # processes updates strictly one at a time (SimpleUpdateProcessor,
-    # max_concurrent_updates=1).  The list handlers rely on this: each
-    # is a read-modify-write of chat_data["list"] across awaits with no
-    # lock.  Enabling concurrent_updates would interleave those at await
-    # points — add a per-chat asyncio.Lock before ever setting it.
+    # max_concurrent_updates=1).  The list state is additionally guarded
+    # by a per-chat asyncio.Lock because the morning-announce loop is a
+    # genuinely concurrent writer; enabling concurrent_updates on top of
+    # that is still untested — don't.
     auth = (
         filters.Chat(chat_id=sorted(cfg.allowed_chat_ids)) & ~filters.UpdateType.EDITED
     )
@@ -415,6 +561,9 @@ def build_application(
         await _reply(update, _HELP.format(project=project.name))
 
     async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat is None:
+            return
         text = " ".join(context.args or []).strip()
         if not text:
             await _reply(
@@ -425,35 +574,41 @@ def build_application(
         if len(text) > 500:
             await _reply(update, "Task text too long — max 500 characters")
             return
-        task = await todoist.add_task_in_project(text, project)
-        today = cfg.today()
-        day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
-        detail = f" (due {_fmt_due(day)})" if day is not None else ""
-        headline = f"✅ Added: {_render_text(task.content)}{detail}"
-        state = _get_state(context)
-        if state is not None and state.day != today:
-            state = None
-        cutoff = state.cutoff if state is not None else today
-        if day is None or day > cutoff:
-            await _reply_html(update, headline)
-            return
-        try:
-            tasks = await todoist.tasks_due_by(project.id, cutoff)
-        except TodoistError:
-            # The add itself succeeded — report it; only the list
-            # refresh failed.
-            await _reply_html(
-                update, f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}"
-            )
-            return
-        await _send_list(update, context, tasks, today, cutoff, headline=headline)
+        async with _chat_lock(chat.id):
+            task = await todoist.add_task_in_project(text, project)
+            today = cfg.today()
+            day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
+            detail = f" (due {_fmt_due(day)})" if day is not None else ""
+            headline = f"✅ Added: {_render_text(task.content)}{detail}"
+            state = _get_state(context.chat_data)
+            if state is not None and state.day != today:
+                state = None
+            cutoff = state.cutoff if state is not None else today
+            if day is None or day > cutoff:
+                await _reply_html(update, headline)
+                return
+            try:
+                tasks = await todoist.tasks_due_by(project.id, cutoff)
+            except TodoistError:
+                # The add itself succeeded — report it; only the list
+                # refresh failed.
+                await _reply_html(
+                    update,
+                    f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}",
+                )
+                return
+            await _send_list(update, context, tasks, today, cutoff, headline=headline)
 
     def _cmd_list(days: int, name: str) -> Handler:
         async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            today = cfg.today()
-            cutoff = today + timedelta(days=days)
-            tasks = await todoist.tasks_due_by(project.id, cutoff)
-            await _send_list(update, context, tasks, today, cutoff)
+            chat = update.effective_chat
+            if chat is None:
+                return
+            async with _chat_lock(chat.id):
+                today = cfg.today()
+                cutoff = today + timedelta(days=days)
+                tasks = await todoist.tasks_due_by(project.id, cutoff)
+                await _send_list(update, context, tasks, today, cutoff)
 
         cmd.__name__ = name
         return guarded(cmd, typing=True)
@@ -461,14 +616,17 @@ def build_application(
     async def _require_state(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> _ListState | None:
-        """State of today's last shown list, or a reply explaining why not."""
+        """State of today's last shown list, or a reply explaining why not.
+
+        Callers hold the chat lock.
+        """
         today = cfg.today()
-        state = _get_state(context)
+        state = _get_state(context.chat_data)
         if state is None:
             await _reply(update, f"Send {_LIST_CMDS} first")
             return None
         if state.day != today:
-            _set_state(context, None)
+            _set_state(context.chat_data, None)
             await _reply(
                 update,
                 f"The last list is from a previous day — send {_LIST_CMDS}",
@@ -477,99 +635,112 @@ def build_application(
         return state
 
     async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat is None:
+            return
         query = " ".join(context.args or []).strip()
         if not query:
             await _reply(update, f"Usage: /done <id> — id shown by {_LIST_CMDS}")
             return
-        state = await _require_state(update, context)
-        if state is None:
-            return
-        folded = query.casefold()
-        resolved = _resolve_ids([item.task_id for item in state.items], folded)
-        if not resolved:
-            await _reply(update, "No match in the last shown list")
-            return
-        if len(resolved) > 1:
-            await _reply(
-                update,
-                f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-            )
-            return
-        item = next(item for item in state.items if item.task_id == resolved[0])
-        if item.done:
-            # Never call the API again: for a recurring task a second
-            # complete would close the *next* occurrence.
-            await _reply(update, f"Already completed — send {_LIST_CMDS} to refresh")
-            return
-        try:
-            await todoist.complete_task(item.task_id)
-        except TodoistError as exc:
-            await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
-            return
-        next_due: date | None = None
-        if item.recurring:
+        async with _chat_lock(chat.id):
+            state = await _require_state(update, context)
+            if state is None:
+                return
+            folded = query.casefold()
+            resolved = _resolve_ids([item.task_id for item in state.items], folded)
+            if not resolved:
+                await _reply(update, "No match in the last shown list")
+                return
+            if len(resolved) > 1:
+                await _reply(
+                    update,
+                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
+                )
+                return
+            item = next(item for item in state.items if item.task_id == resolved[0])
+            if item.done:
+                # Never call the API again: for a recurring task a second
+                # complete would close the *next* occurrence.
+                await _reply(
+                    update, f"Already completed — send {_LIST_CMDS} to refresh"
+                )
+                return
             try:
-                rolled = await todoist.get_task(item.task_id)
-                if rolled.due is not None:
-                    day = rolled.due.date
-                    next_due = day.date() if isinstance(day, datetime) else day
-            except TodoistError:
-                logger.warning("could not read next occurrence of %s", item.task_id)
-        item.done = True
-        if next_due is not None:
-            # Show the rolled occurrence's date instead of the stale one
-            # the user just completed.
-            item.due = next_due
-        await _edit_list(update, context, state)
-        if item.recurring and next_due is not None:
-            await _reply_html(
-                update,
-                f"✅ {_render_text(item.text)} — "
-                f"next occurrence: {_fmt_due(next_due)}",
-            )
-        else:
-            await _reply_html(update, f"✅ {_render_text(item.text)}")
+                await todoist.complete_task(item.task_id)
+            except TodoistError as exc:
+                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
+                return
+            next_due: date | None = None
+            if item.recurring:
+                try:
+                    rolled = await todoist.get_task(item.task_id)
+                    if rolled.due is not None:
+                        day = rolled.due.date
+                        next_due = day.date() if isinstance(day, datetime) else day
+                except TodoistError:
+                    logger.warning("could not read next occurrence of %s", item.task_id)
+            item.done = True
+            if next_due is not None:
+                # Show the rolled occurrence's date instead of the stale one
+                # the user just completed.
+                item.due = next_due
+            await _edit_list(update, context, state)
+            if item.recurring and next_due is not None:
+                await _reply_html(
+                    update,
+                    f"✅ {_render_text(item.text)} — "
+                    f"next occurrence: {_fmt_due(next_due)}",
+                )
+            else:
+                await _reply_html(update, f"✅ {_render_text(item.text)}")
 
     async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat is None:
+            return
         query = " ".join(context.args or []).strip()
         if not query:
             await _reply(update, f"Usage: /undo <id> — id shown by {_LIST_CMDS}")
             return
-        state = await _require_state(update, context)
-        if state is None:
-            return
-        folded = query.casefold()
-        resolved = _resolve_ids([item.task_id for item in state.items], folded)
-        if len(resolved) > 1:
-            await _reply(
-                update,
-                f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-            )
-            return
-        if not resolved:
-            await _reply(update, "No match in the last shown list")
-            return
-        item = next(item for item in state.items if item.task_id == resolved[0])
-        if not item.done:
-            await _reply(update, "Not completed — nothing to undo")
-            return
-        if item.recurring:
-            # Blanket refusal: undoing a rolled completion is unsafe (the
-            # series already advanced); a series that *ended* on the last
-            # occurrence could be undone, but distinguishing the two
-            # needs extra state — accepted false negative.
-            await _reply(update, "⚠ can't undo a recurring completion")
-            return
-        try:
-            await todoist.uncomplete_task(item.task_id)
-        except TodoistError as exc:
-            await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
-            return
-        item.done = False
-        await _edit_list(update, context, state)
-        await _reply_html(update, f"↩️ {_render_text(item.text)}")
+        async with _chat_lock(chat.id):
+            state = await _require_state(update, context)
+            if state is None:
+                return
+            folded = query.casefold()
+            resolved = _resolve_ids([item.task_id for item in state.items], folded)
+            if len(resolved) > 1:
+                await _reply(
+                    update,
+                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
+                )
+                return
+            if not resolved:
+                await _reply(update, "No match in the last shown list")
+                return
+            item = next(item for item in state.items if item.task_id == resolved[0])
+            if not item.done:
+                await _reply(update, "Not completed — nothing to undo")
+                return
+            if item.recurring:
+                # Blanket refusal: undoing a rolled completion is unsafe (the
+                # series already advanced); a series that *ended* on the last
+                # occurrence could be undone, but distinguishing the two
+                # needs extra state — accepted false negative.
+                await _reply(update, "⚠ can't undo a recurring completion")
+                return
+            try:
+                await todoist.uncomplete_task(item.task_id)
+            except TodoistError as exc:
+                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
+                return
+            item.done = False
+            await _edit_list(update, context, state)
+            await _reply_html(update, f"↩️ {_render_text(item.text)}")
 
     async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat is None:
+            return
         raw = " ".join(context.args or []).strip()
         query, separator, new_text = raw.partition(" ")
         if not separator or not new_text.strip():
@@ -582,32 +753,33 @@ def build_application(
         if len(new_text) > 500:
             await _reply(update, "Task text too long — max 500 characters")
             return
-        state = await _require_state(update, context)
-        if state is None:
-            return
-        folded = query.casefold()
-        resolved = _resolve_ids([item.task_id for item in state.items], folded)
-        if not resolved:
-            await _reply(update, "No match in the last shown list")
-            return
-        if len(resolved) > 1:
-            await _reply(
-                update,
-                f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-            )
-            return
-        item = next(item for item in state.items if item.task_id == resolved[0])
-        if item.done:
-            await _reply(update, "Already completed — can't edit")
-            return
-        try:
-            await todoist.update_task_content(item.task_id, new_text)
-        except TodoistError as exc:
-            await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
-            return
-        item.text = new_text
-        await _edit_list(update, context, state)
-        await _reply_html(update, f"✏️ {_render_text(new_text)}")
+        async with _chat_lock(chat.id):
+            state = await _require_state(update, context)
+            if state is None:
+                return
+            folded = query.casefold()
+            resolved = _resolve_ids([item.task_id for item in state.items], folded)
+            if not resolved:
+                await _reply(update, "No match in the last shown list")
+                return
+            if len(resolved) > 1:
+                await _reply(
+                    update,
+                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
+                )
+                return
+            item = next(item for item in state.items if item.task_id == resolved[0])
+            if item.done:
+                await _reply(update, "Already completed — can't edit")
+                return
+            try:
+                await todoist.update_task_content(item.task_id, new_text)
+            except TodoistError as exc:
+                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
+                return
+            item.text = new_text
+            await _edit_list(update, context, state)
+            await _reply_html(update, f"✏️ {_render_text(new_text)}")
 
     async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -630,6 +802,33 @@ def build_application(
                 return
         await _reply(update, "Unknown command — try /help")
 
+    morning_task: asyncio.Task[None] | None = None
+
+    async def post_init(application: Application) -> None:
+        nonlocal morning_task
+        if cfg.morning_announce_time is not None:
+            # Plain asyncio.create_task: Application.create_task before
+            # start() warns and would register an infinite task the
+            # application tried to await at stop(); we cancel it
+            # ourselves in post_stop.
+            morning_task = asyncio.create_task(
+                _morning_loop(cfg, project, todoist, application),
+                name="morning-announce",
+            )
+
+    async def post_stop(application: Application) -> None:
+        # post_stop runs after stop() but before shutdown() closes the
+        # bot's HTTP client, so a mid-send cancellation here cannot
+        # turn into a RuntimeError from a closed client.
+        if morning_task is not None:
+            morning_task.cancel()
+            try:
+                await morning_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("morning task raised during shutdown")
+
     async def post_shutdown(application: Application) -> None:
         await todoist.close()
 
@@ -643,6 +842,8 @@ def build_application(
     application = (
         Application.builder()
         .token(cfg.telegram_token)
+        .post_init(post_init)
+        .post_stop(post_stop)
         .post_shutdown(post_shutdown)
         .build()
     )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone, tzinfo
+from datetime import date, datetime, time, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -18,6 +18,9 @@ class Config:
     project_id: str
     allowed_chat_ids: frozenset[int]
     timezone: tzinfo | None
+    # Wall-clock time of the daily morning list in resolved_timezone;
+    # None disables the morning announcement (MORNING_ANNOUNCE_TIME=off).
+    morning_announce_time: time | None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -28,6 +31,7 @@ class Config:
             project_id=_require(env, "TODOIST_PROJECT_ID"),
             allowed_chat_ids=_parse_chat_ids(_require(env, "ALLOWED_CHAT_IDS")),
             timezone=_parse_timezone(env),
+            morning_announce_time=_parse_morning_time(env),
         )
 
     def today(self) -> date:
@@ -62,6 +66,28 @@ def _parse_timezone(env: Mapping[str, str]) -> tzinfo | None:
         raise ConfigError(
             f"TIMEZONE is not a valid IANA time zone: {raw!r} "
             "(expected e.g. Asia/Kolkata)"
+        ) from exc
+
+
+def _parse_morning_time(env: Mapping[str, str]) -> time | None:
+    """MORNING_ANNOUNCE_TIME: HH:MM wall clock, or 'off' to disable.
+
+    Unset falls back to the default 09:00 in the resolved timezone.
+    """
+    raw = env.get("MORNING_ANNOUNCE_TIME", "").strip()
+    if not raw:
+        return time(9, 0)
+    if raw.casefold() == "off":
+        return None
+    hour_text, separator, minute_text = raw.partition(":")
+    try:
+        if not separator:
+            raise ValueError(raw)
+        return time(int(hour_text), int(minute_text))
+    except ValueError as exc:
+        raise ConfigError(
+            f"MORNING_ANNOUNCE_TIME is not an HH:MM time or 'off': {raw!r} "
+            "(expected e.g. 09:00)"
         ) from exc
 
 
