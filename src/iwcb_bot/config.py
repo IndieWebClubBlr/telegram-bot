@@ -24,6 +24,8 @@ class Config:
     # Todoist assignee name → Telegram mention target (@handle or
     # numeric user id), from ASSIGNEE_MENTIONS.
     assignee_mentions: dict[str, str] = field(default_factory=dict)
+    # Logging level name (DEBUG/INFO/WARNING/ERROR), from LOG_LEVEL.
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -36,6 +38,7 @@ class Config:
             timezone=_parse_timezone(env),
             morning_announce_time=_parse_morning_time(env),
             assignee_mentions=_parse_assignee_mentions(env),
+            log_level=_parse_log_level(env),
         )
 
     def today(self) -> date:
@@ -58,6 +61,24 @@ def _require(env: Mapping[str, str], name: str) -> str:
     if not value:
         raise ConfigError(f"{name} is not set")
     return value
+
+
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def _parse_log_level(env: Mapping[str, str]) -> str:
+    """LOG_LEVEL: DEBUG, INFO, WARNING or ERROR (case-insensitive).
+
+    Unset falls back to INFO.  DEBUG logs command actions and numeric
+    chat/user/task ids only — never names, usernames, chat titles or
+    task text.
+    """
+    raw = env.get("LOG_LEVEL", "").strip().upper()
+    if not raw:
+        return "INFO"
+    if raw in _LOG_LEVELS:
+        return raw
+    raise ConfigError(f"LOG_LEVEL is not one of {', '.join(_LOG_LEVELS)}: {raw!r}")
 
 
 def _parse_timezone(env: Mapping[str, str]) -> tzinfo | None:

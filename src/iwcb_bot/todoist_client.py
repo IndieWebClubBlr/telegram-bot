@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass
 from datetime import date, datetime, tzinfo
@@ -128,9 +129,15 @@ class TodoistClient:
                 # First fetch failed (offline, 403, rate limit, …) —
                 # degrade to None, never crash the caller; the next
                 # call retries.
+                logger.debug("collaborator_name id=%s: cache unavailable", assignee_id)
                 return None
             name = self._collaborators.get(assignee_id)
             if name is not None or assignee_id in self._collaborator_misses:
+                logger.debug(
+                    "collaborator_name id=%s: %s",
+                    assignee_id,
+                    "hit" if name is not None else "known-miss",
+                )
                 return name
             refreshed = await self._refresh_collaborators(project_id)
             name = self._collaborators.get(assignee_id)
@@ -157,10 +164,15 @@ class TodoistClient:
             if self._collaborators is None:
                 await self._refresh_collaborators(project_id)
             if self._collaborators is None:
+                logger.debug("collaborator_id_for_name: cache unavailable")
                 return None
             folded = name.casefold()
             collaborator_id = self._id_by_folded_name(folded)
             if collaborator_id is not None or folded in self._collaborator_name_misses:
+                logger.debug(
+                    "collaborator_id_for_name: %s",
+                    "hit" if collaborator_id is not None else "known-miss",
+                )
                 return collaborator_id
             refreshed = await self._refresh_collaborators(project_id)
             collaborator_id = (
@@ -189,7 +201,9 @@ class TodoistClient:
         bookkeeping must not record anything — the next call retries.
         """
         try:
-            collaborators = await self._pages(self._api.get_collaborators(project_id))
+            collaborators = await self._pages(
+                "get_collaborators", self._api.get_collaborators(project_id)
+            )
         except Exception:
             # Catches everything the SDK or pagination can raise
             # (TodoistError, HTTPError, TypeError on an unexpected
@@ -202,7 +216,7 @@ class TodoistClient:
 
     async def resolve_project(self, project_id: str) -> Project:
         try:
-            return await self._run(self._api.get_project(project_id))
+            return await self._run("get_project", self._api.get_project(project_id))
         except TodoistAPIError as exc:
             if exc.status == 404:
                 raise ConfigError(
@@ -213,7 +227,9 @@ class TodoistClient:
             raise TodoistError(f"could not load project {project_id!r}: {exc}") from exc
 
     async def tasks_due_by(self, project_id: str, cutoff: date) -> list[DueTask]:
-        tasks = await self._pages(self._api.get_tasks(project_id=project_id, limit=200))
+        tasks = await self._pages(
+            "get_tasks", self._api.get_tasks(project_id=project_id, limit=200)
+        )
         due_tasks: list[DueTask] = []
         for task in tasks:
             day = effective_day(task.due, task.deadline, self._timezone)
@@ -232,7 +248,9 @@ class TodoistClient:
         content.  day is the same earlier-of-due-and-deadline value
         /today uses.
         """
-        tasks = await self._pages(self._api.get_tasks(project_id=project_id, limit=200))
+        tasks = await self._pages(
+            "get_tasks", self._api.get_tasks(project_id=project_id, limit=200)
+        )
         due: list[DueTask] = []
         upcoming: list[DueTask] = []
         undated: list[DueTask] = []
@@ -258,16 +276,18 @@ class TodoistClient:
         # itself names a project, so prepend the configured project
         # token (before any trailing // description in the text).
         quick_text = f"{_project_token(project.name)} {text}"
-        task = await self._run(self._api.add_task_quick(quick_text))
+        task = await self._run("add_task_quick", self._api.add_task_quick(quick_text))
         if task.project_id == project.id:
             return task
         try:
-            moved = await self._run(self._api.move_task(task.id, project_id=project.id))
+            moved = await self._run(
+                "move_task", self._api.move_task(task.id, project_id=project.id)
+            )
         except TodoistError as exc:
             # Don't leave a stray Inbox task behind a reported failure:
             # roll back best-effort, then surface the original error.
             try:
-                removed = await self._run(self._api.delete_task(task.id))
+                removed = await self._run("delete_task", self._api.delete_task(task.id))
             except TodoistError:
                 removed = False
             if not removed:
@@ -286,40 +306,86 @@ class TodoistClient:
             raise TodoistError("Todoist did not move the task into the project")
         # move_task returns only a success flag; re-fetch so callers see
         # the task in its real (moved) project.
-        return await self._run(self._api.get_task(task.id))
+        return await self._run("get_task", self._api.get_task(task.id))
 
     async def get_task(self, task_id: str) -> Task:
-        return await self._run(self._api.get_task(task_id))
+        return await self._run("get_task", self._api.get_task(task_id))
 
     async def update_task_content(self, task_id: str, content: str) -> Task:
-        return await self._run(self._api.update_task(task_id, content=content))
+        return await self._run(
+            "update_task", self._api.update_task(task_id, content=content)
+        )
 
     async def complete_task(self, task_id: str) -> None:
-        closed = await self._run(self._api.complete_task(task_id))
+        closed = await self._run("complete_task", self._api.complete_task(task_id))
         if not closed:
             raise TodoistError("Todoist did not close the task")
 
     async def uncomplete_task(self, task_id: str) -> None:
-        reopened = await self._run(self._api.uncomplete_task(task_id))
+        reopened = await self._run(
+            "uncomplete_task", self._api.uncomplete_task(task_id)
+        )
         if not reopened:
             raise TodoistError("Todoist did not reopen the task")
 
-    async def _run(self, awaitable: Awaitable[T]) -> T:
+    async def _run(self, label: str, awaitable: Awaitable[T]) -> T:
+        """Await one SDK call, timing it for DEBUG.
+
+        `label` is a fixed method name — never arguments, task text or
+        collaborator names; ids are ok (correlation keys).
+        """
+        started = time.monotonic()
         try:
-            return await awaitable
+            result = await awaitable
         except requests.exceptions.HTTPError as exc:
+            logger.debug(
+                "todoist %s failed in %.0fms: HTTP %s",
+                label,
+                (time.monotonic() - started) * 1000,
+                _status_of(exc),
+            )
             raise _api_error(exc) from exc
         except requests.exceptions.RequestException as exc:
+            logger.debug(
+                "todoist %s failed in %.0fms: network",
+                label,
+                (time.monotonic() - started) * 1000,
+            )
             raise TodoistError("Could not reach the Todoist API") from exc
+        logger.debug(
+            "todoist %s ok in %.0fms", label, (time.monotonic() - started) * 1000
+        )
+        return result
 
-    async def _pages(self, awaitable: Awaitable[AsyncIterator[list[T]]]) -> list[T]:
+    async def _pages(
+        self, label: str, awaitable: Awaitable[AsyncIterator[list[T]]]
+    ) -> list[T]:
+        started = time.monotonic()
         try:
             stream = await awaitable
-            return [item async for page in stream for item in page]
+            items = [item async for page in stream for item in page]
         except requests.exceptions.HTTPError as exc:
+            logger.debug(
+                "todoist %s failed in %.0fms: HTTP %s",
+                label,
+                (time.monotonic() - started) * 1000,
+                _status_of(exc),
+            )
             raise _api_error(exc) from exc
         except requests.exceptions.RequestException as exc:
+            logger.debug(
+                "todoist %s failed in %.0fms: network",
+                label,
+                (time.monotonic() - started) * 1000,
+            )
             raise TodoistError("Could not reach the Todoist API") from exc
+        logger.debug(
+            "todoist %s ok in %.0fms (%d item(s))",
+            label,
+            (time.monotonic() - started) * 1000,
+            len(items),
+        )
+        return items
 
 
 def _project_token(name: str) -> str:
@@ -327,7 +393,10 @@ def _project_token(name: str) -> str:
     return "#" + name.replace("\\", "\\\\").replace(" ", "\\ ")
 
 
-def _api_error(exc: requests.exceptions.HTTPError) -> TodoistAPIError:
+def _status_of(exc: requests.exceptions.HTTPError) -> object:
     response = exc.response
-    status = response.status_code if response is not None else "?"
-    return TodoistAPIError(status)
+    return response.status_code if response is not None else "?"
+
+
+def _api_error(exc: requests.exceptions.HTTPError) -> TodoistAPIError:
+    return TodoistAPIError(_status_of(exc))

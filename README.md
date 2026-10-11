@@ -78,6 +78,7 @@ errors) — plus a few optional ones:
 | `TIMEZONE` | Optional IANA time zone for the bot's "today" calculations (e.g. `Asia/Kolkata`). The server and the bot's users are often in different time zones, so set this explicitly; an invalid value aborts startup with exit code 2. Falls back to the server's local time zone. Naive due datetimes (the normal Todoist shape) are taken as wall-clock times in this zone; timezone-aware dues are converted into it before the calendar day is taken |
 | `MORNING_ANNOUNCE_TIME` | Optional wall-clock time (24h `HH:MM`, in the `TIMEZONE` zone) at which the bot proactively sends the day's task list to every allowed chat. Defaults to `09:00`; set to `off` to disable. An invalid value aborts startup with exit code 2 |
 | `ASSIGNEE_MENTIONS` | Optional `;`-separated `Todoist Name=Telegram` pairs mapping shared-project assignee names to Telegram mentions — `Abhinav Nair=@abnv;Priya Singh=123456789`. Names match case-insensitively; mapped names render as clickable mentions, unmapped assignees as plain text, unassigned tasks show no suffix. An invalid value aborts startup with exit code 2 |
+| `LOG_LEVEL` | Optional bot log level: `DEBUG`, `INFO`, `WARNING` or `ERROR` (case-insensitive). Defaults to `INFO`. `DEBUG` logs each command action and Todoist API call with durations, and includes numeric chat/user/task ids for correlation — it never logs names, usernames, chat titles, task text or command arguments. An invalid value aborts startup with exit code 2 |
 
 ## Assignees
 

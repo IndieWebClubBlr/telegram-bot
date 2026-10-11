@@ -19,6 +19,7 @@ let
       TODOIST_PROJECT_ID=${cfg.projectId}
       ALLOWED_CHAT_IDS=${lib.concatMapStringsSep "," toString cfg.allowedChatIds}
       MORNING_ANNOUNCE_TIME=${cfg.morningAnnounceTime}
+      LOG_LEVEL=${cfg.logLevel}
     ''
     + lib.optionalString (cfg.timeZone != null) "TIMEZONE=${cfg.timeZone}\n"
     + lib.optionalString (cfg.assigneeMentions != { }) (
@@ -106,6 +107,24 @@ in
         or "=". Leave empty (the default) to show plain assignee names
         only. Can also be set via the secrets environment file instead,
         in which case leave this option empty.
+      '';
+    };
+
+    logLevel = lib.mkOption {
+      type = lib.types.enum [
+        "DEBUG"
+        "INFO"
+        "WARNING"
+        "ERROR"
+      ];
+      default = "INFO";
+      example = "DEBUG";
+      description = ''
+        Bot log level (LOG_LEVEL). DEBUG logs each command action and
+        Todoist API call with durations, plus numeric chat/user/task
+        ids for correlation; it never logs names, usernames, chat
+        titles, task text or command arguments. INFO (the default)
+        logs only startup, warnings and errors.
       '';
     };
 

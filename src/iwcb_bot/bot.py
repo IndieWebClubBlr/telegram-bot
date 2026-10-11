@@ -121,11 +121,27 @@ Commands (project: {project}):
 def guarded(handler: Handler, *, typing: bool = False) -> Handler:
     @functools.wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        started = asyncio.get_running_loop().time()
+        chat = update.effective_chat
+        user = update.effective_user
+        # Ids only — never usernames, chat titles, message text or
+        # command arguments.
+        logger.debug(
+            "%s chat=%s user=%s",
+            handler.__name__,
+            chat.id if chat else None,
+            user.id if user else None,
+        )
         ticker: asyncio.Task[None] | None = None
         try:
             if typing:
                 ticker = await _start_typing(update, context)
             await handler(update, context)
+            logger.debug(
+                "%s done in %.0fms",
+                handler.__name__,
+                (asyncio.get_running_loop().time() - started) * 1000,
+            )
         except TodoistError as exc:
             logger.warning("%s failed: %s", handler.__name__, exc)
             await _reply_safely(update, f"⚠ {exc}")
@@ -422,6 +438,7 @@ async def _send_chunks(
     first = await send(chunks[0])
     for chunk in chunks[1:]:
         await send(chunk)
+    logger.debug("sent %d chunk(s), editable=%s", len(chunks), len(chunks) == 1)
     return first.message_id if len(chunks) == 1 else None
 
 
@@ -512,6 +529,7 @@ async def _edit_list(
             text=rendered,
             parse_mode=ParseMode.HTML,
         )
+        logger.debug("edited list message chat=%s (%d chars)", chat.id, len(rendered))
     except BadRequest as exc:
         if "not modified" in str(exc):
             logger.debug("list message already up to date")
@@ -619,6 +637,7 @@ async def _morning_loop(
         await asyncio.sleep(max(0.0, target.timestamp() - datetime.now(tz).timestamp()))
         try:
             today = cfg.today()
+            logger.debug("morning cycle start, %d chat(s)", len(cfg.allowed_chat_ids))
             try:
                 tasks = await todoist.tasks_due_by(project.id, cutoff=today)
             except TodoistError:
@@ -632,6 +651,9 @@ async def _morning_loop(
                 async with _chat_lock(chat_id):
                     try:
                         if tasks is None:
+                            logger.debug(
+                                "morning chat=%s: sending fetch-failed notice", chat_id
+                            )
                             with suppress(TelegramError):
                                 await application.bot.send_message(
                                     chat_id=chat_id,
@@ -648,6 +670,7 @@ async def _morning_loop(
                                 todoist,
                                 project.id,
                             )
+                            logger.debug("morning chat=%s: sent", chat_id)
                     except TelegramError:
                         logger.warning("morning send failed for chat %s", chat_id)
         except Exception:
@@ -838,9 +861,11 @@ def build_application(
             folded = query.casefold()
             resolved = _resolve_query(states, folded)
             if not resolved:
+                logger.debug("cmd_done: no match (%d state(s))", len(states))
                 await _reply(update, "No match in the last shown list")
                 return
             if len(resolved) > 1:
+                logger.debug("cmd_done: ambiguous, %d matches", len(resolved))
                 await _reply(
                     update,
                     f"Ambiguous — matches {len(resolved)} tasks, be more specific",
@@ -860,6 +885,7 @@ def build_application(
                 # A struck copy in *any* stored list blocks this — most
                 # often the chat list, which a /mine refresh does not
                 # replace, so point at the chat list refresh.
+                logger.debug("cmd_done task=%s: already done in a stored list", task_id)
                 await _reply(
                     update, f"Already completed — send {_LIST_CMDS} to refresh"
                 )
@@ -881,6 +907,11 @@ def build_application(
             # Strike the copy in every stored list (chat + any /mine),
             # showing the rolled occurrence's date for recurring tasks.
             touched = sync_item(mutation, task_id, done=True, due=next_due)
+            logger.debug(
+                "cmd_done task=%s: completed, synced %d list copy(ies)",
+                task_id,
+                len(touched),
+            )
             await _edit_states(update, context, touched, mentions)
             if item.recurring and next_due is not None:
                 await _reply_html(
@@ -909,12 +940,14 @@ def build_application(
             folded = query.casefold()
             resolved = _resolve_query(states, folded)
             if len(resolved) > 1:
+                logger.debug("cmd_undo: ambiguous, %d matches", len(resolved))
                 await _reply(
                     update,
                     f"Ambiguous — matches {len(resolved)} tasks, be more specific",
                 )
                 return
             if not resolved:
+                logger.debug("cmd_undo: no match (%d state(s))", len(states))
                 await _reply(update, "No match in the last shown list")
                 return
             task_id = resolved[0]
@@ -939,6 +972,11 @@ def build_application(
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
             touched = sync_item(_mutation_states(context, states), task_id, done=False)
+            logger.debug(
+                "cmd_undo task=%s: reopened, synced %d list copy(ies)",
+                task_id,
+                len(touched),
+            )
             await _edit_states(update, context, touched, mentions)
             await _reply_html(update, f"↩️ {_render_text(item.text)}")
 
@@ -966,9 +1004,11 @@ def build_application(
             folded = query.casefold()
             resolved = _resolve_query(states, folded)
             if not resolved:
+                logger.debug("cmd_edit: no match (%d state(s))", len(states))
                 await _reply(update, "No match in the last shown list")
                 return
             if len(resolved) > 1:
+                logger.debug("cmd_edit: ambiguous, %d matches", len(resolved))
                 await _reply(
                     update,
                     f"Ambiguous — matches {len(resolved)} tasks, be more specific",
@@ -978,6 +1018,7 @@ def build_application(
             item = _find_item(states, task_id)
             assert item is not None  # resolved from the same union
             if any_done(states, task_id):
+                logger.debug("cmd_edit task=%s: already done, refusing", task_id)
                 await _reply(update, "Already completed — can't edit")
                 return
             try:
@@ -987,6 +1028,11 @@ def build_application(
                 return
             touched = sync_item(
                 _mutation_states(context, states), task_id, text=new_text
+            )
+            logger.debug(
+                "cmd_edit task=%s: renamed, synced %d list copy(ies)",
+                task_id,
+                len(touched),
             )
             await _edit_states(update, context, touched, mentions)
             await _reply_html(update, f"✏️ {_render_text(new_text)}")
@@ -1003,6 +1049,7 @@ def build_application(
                 user.id, user.username, cfg.assignee_mentions
             )
             if assignee_name is None:
+                logger.debug("cmd_mine user=%s: no ASSIGNEE_MENTIONS mapping", user.id)
                 await _reply(
                     update,
                     "I can't match your Telegram account to a Todoist "
@@ -1014,6 +1061,9 @@ def build_application(
                 project.id, assignee_name
             )
             if assignee_id is None:
+                logger.debug(
+                    "cmd_mine user=%s: collaborator not in project cache", user.id
+                )
                 await _reply(
                     update,
                     f"Todoist collaborator {assignee_name!r} not found on this "
@@ -1026,6 +1076,14 @@ def build_application(
                 project.id, assignee_id, today
             )
             selected, dividers = take_mine(due, upcoming, undated, _MINE_LIMIT)
+            logger.debug(
+                "cmd_mine user=%s: due=%d upcoming=%d undated=%d selected=%d",
+                user.id,
+                len(due),
+                len(upcoming),
+                len(undated),
+                len(selected),
+            )
             if not selected:
                 set_mine_state(context.chat_data, user.id, None)
                 await _reply(update, "Nothing assigned to you 🎉")

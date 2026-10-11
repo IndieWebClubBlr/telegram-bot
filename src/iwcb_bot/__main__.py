@@ -48,17 +48,30 @@ class _SecretRedactionFilter(logging.Filter):
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
     try:
         cfg = Config.from_env()
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
+
+    logging.basicConfig(
+        level=getattr(logging, cfg.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    # Pinned even under LOG_LEVEL=DEBUG: both libraries log full
+    # payloads at DEBUG — httpx (and its httpcore transport layer)
+    # embed Bot-API URLs and headers (the token is redacted by the
+    # filter below, but it's still far too noisy), and
+    # python-telegram-bot's "Processing update …" / "Calling Bot API
+    # endpoint …" lines dump incoming message text, usernames and
+    # outgoing task content, which the documented DEBUG contract (ids
+    # and action names only) must never emit.  The bot's own DEBUG
+    # lines already cover what matters: durations, outcomes and ids.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # urllib3 backs the Todoist SDK's sync requests session.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
 
     # Handler filters run for records propagated from child loggers
     # (e.g. PTB's bootstrap networkloop, which logs the token on a
@@ -81,7 +94,8 @@ def main() -> None:
 
     application = build_application(cfg, project, todoist)
     logger = logging.getLogger(__name__)
-    logger.info("Polling for project %s (%s)", project.name, project.id)
+    # Project id only — the name is content, not a correlation key.
+    logger.info("Polling project %s", project.id)
     try:
         # The Todoist client is closed by the application's post_shutdown
         # hook (bot.py) — inside the polling event loop, where the

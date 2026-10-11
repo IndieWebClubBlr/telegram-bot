@@ -167,3 +167,26 @@ class TestSecrets:
         assert "secret-todoist" not in text
         assert "telegram_token" not in text
         assert "todoist_token" not in text
+
+
+class TestLogLevel:
+    def test_default_is_info(self) -> None:
+        assert make_config().log_level == "INFO"
+
+    def test_unset_is_info(self) -> None:
+        assert make_config(LOG_LEVEL="").log_level == "INFO"
+
+    @pytest.mark.parametrize("level", ["DEBUG", "INFO", "WARNING", "ERROR"])
+    def test_valid_levels(self, level: str) -> None:
+        assert make_config(LOG_LEVEL=level).log_level == level
+
+    def test_case_insensitive(self) -> None:
+        assert make_config(LOG_LEVEL="debug").log_level == "DEBUG"
+
+    def test_padded_value_accepted(self) -> None:
+        assert make_config(LOG_LEVEL="  WARNING  ").log_level == "WARNING"
+
+    @pytest.mark.parametrize("raw", ["TRACE", "INFOX", "CRITICAL", "0"])
+    def test_invalid_rejected(self, raw: str) -> None:
+        with pytest.raises(ConfigError, match="LOG_LEVEL"):
+            make_config(LOG_LEVEL=raw)
