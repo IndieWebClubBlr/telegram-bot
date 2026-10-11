@@ -115,10 +115,8 @@ Commands (project: {project}):
 /start or /help — this message
 
 - ids are shown in lowercase and matched case-insensitively
-- {list_cmds} or /mine show lists that /done, /undo, /edit, /assign and
-  /due act on; edits appear in those messages only — refresh to re-fetch
-- /done, /undo, /edit, /assign and /due sync across every user's
-  /mine list and the chat list
+- {list_cmds} or /mine show lists that /done, /undo, /edit, /assign and /due act on; edits appear in those messages only — refresh to re-fetch
+- /done, /undo, /edit, /assign and /due sync across every user's /mine list and the chat list
 - /add refreshes the shown list when the new task falls inside its range
 """.replace("{list_cmds}", _LIST_CMDS)
 
