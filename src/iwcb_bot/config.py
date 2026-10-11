@@ -121,12 +121,16 @@ def _parse_assignee_mentions(env: Mapping[str, str]) -> dict[str, str]:
 
     The target is a Telegram @username or a numeric user id.  Names are
     matched case-insensitively against Todoist collaborator names at
-    render time.  Duplicate names: last pair wins.
+    render time.  Names and targets must each be unique (compared
+    case-insensitively): an ambiguous mapping would make /mine pick
+    silently while /assign refuses, so duplicates abort startup.
     """
     raw = env.get("ASSIGNEE_MENTIONS", "").strip()
     if not raw:
         return {}
     mentions: dict[str, str] = {}
+    seen_names: dict[str, str] = {}  # casefolded name -> original spelling
+    seen_targets: dict[str, str] = {}  # casefolded target -> owner name
     for part in raw.split(";"):
         pair = part.strip()
         if not pair:
@@ -137,18 +141,33 @@ def _parse_assignee_mentions(env: Mapping[str, str]) -> dict[str, str]:
         is_handle = (
             target.startswith("@")
             and len(target) > 1
-            and all(c.isalnum() or c == "_" for c in target[1:])
+            and all(c.isascii() and (c.isalnum() or c == "_") for c in target[1:])
         )
         if not separator or not name:
             raise ConfigError(
                 f"ASSIGNEE_MENTIONS entry is not 'Name=target': {pair!r} "
                 "(expected e.g. 'Abhinav Nair=@abnv')"
             )
-        if not is_handle and not target.isdigit():
+        if not is_handle and not (target.isascii() and target.isdigit()):
             raise ConfigError(
                 f"ASSIGNEE_MENTIONS target is not an @handle or numeric id: "
                 f"{target!r} (in entry {pair!r})"
             )
+        name_key = name.casefold()
+        if name_key in seen_names:
+            raise ConfigError(
+                f"ASSIGNEE_MENTIONS maps name {seen_names[name_key]!r} more "
+                f"than once (also as {name!r}) — names must be unique"
+            )
+        target_key = target.casefold()
+        if target_key in seen_targets:
+            raise ConfigError(
+                f"ASSIGNEE_MENTIONS target {target!r} is used by more than "
+                f"one name (also by {seen_targets[target_key]!r}) — each "
+                "name needs its own @handle or numeric id"
+            )
+        seen_names[name_key] = name
+        seen_targets[target_key] = name
         mentions[name] = target
     return mentions
 

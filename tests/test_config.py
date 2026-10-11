@@ -105,9 +105,25 @@ class TestAssigneeMentions:
         cfg = make_config(ASSIGNEE_MENTIONS="A B=@ab;")
         assert cfg.assignee_mentions == {"A B": "@ab"}
 
-    def test_duplicate_name_last_wins(self) -> None:
-        cfg = make_config(ASSIGNEE_MENTIONS="A B=@first;A B=@second")
-        assert cfg.assignee_mentions == {"A B": "@second"}
+    def test_duplicate_name_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="more than once"):
+            make_config(ASSIGNEE_MENTIONS="A B=@first;A B=@second")
+
+    def test_duplicate_name_case_insensitive_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="more than once"):
+            make_config(ASSIGNEE_MENTIONS="A B=@first;a b=@second")
+
+    def test_duplicate_target_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="used by more than one name"):
+            make_config(ASSIGNEE_MENTIONS="Ana Diaz=@ab;Ana M Diaz=@ab")
+
+    def test_duplicate_target_case_insensitive_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="used by more than one name"):
+            make_config(ASSIGNEE_MENTIONS="Ana Diaz=@AB;Ana M Diaz=@ab")
+
+    def test_duplicate_numeric_target_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="used by more than one name"):
+            make_config(ASSIGNEE_MENTIONS="A B=123;C D=123")
 
     def test_handle_allows_underscores_and_digits(self) -> None:
         cfg = make_config(ASSIGNEE_MENTIONS="N=@n_9x")
@@ -128,6 +144,16 @@ class TestAssigneeMentions:
     def test_lone_at_sign_rejected(self) -> None:
         with pytest.raises(ConfigError, match="not an @handle or numeric id"):
             make_config(ASSIGNEE_MENTIONS="A B=@")
+
+    def test_non_ascii_digits_rejected(self) -> None:
+        # str.isdigit() is true for fullwidth/Arabic-Indic digits, which
+        # would render a broken tg:// mention and never match a user id.
+        with pytest.raises(ConfigError, match="not an @handle or numeric id"):
+            make_config(ASSIGNEE_MENTIONS="A B=１２３")
+
+    def test_non_ascii_handle_char_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="not an @handle or numeric id"):
+            make_config(ASSIGNEE_MENTIONS="A B=@üser")
 
 
 class TestMorningAnnounceTime:

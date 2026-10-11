@@ -5,7 +5,7 @@ import functools
 import html
 import logging
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from datetime import date, datetime, time, timedelta, tzinfo
 from typing import Any
@@ -117,8 +117,8 @@ Commands (project: {project}):
 - ids are shown in lowercase and matched case-insensitively
 - {list_cmds} or /mine show lists that /done, /undo, /edit, /assign and
   /due act on; edits appear in those messages only — refresh to re-fetch
-- /done, /undo, /edit, /assign and /due sync across your /mine list
-  and the chat list
+- /done, /undo, /edit, /assign and /due sync across every user's
+  /mine list and the chat list
 - /add refreshes the shown list when the new task falls inside its range
 """.replace("{list_cmds}", _LIST_CMDS)
 
@@ -676,8 +676,10 @@ async def _morning_loop(
                                 project.id,
                             )
                             logger.debug("morning chat=%s: sent", chat_id)
-                    except TelegramError:
-                        logger.warning("morning send failed for chat %s", chat_id)
+                    except Exception:
+                        # Contain one chat's failure so the remaining
+                        # chats still get today's list.
+                        logger.exception("morning send failed for chat %s", chat_id)
         except Exception:
             # Never let an unexpected error (bug, closed client at
             # shutdown) kill the schedule; CancelledError is a

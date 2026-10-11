@@ -103,10 +103,12 @@ in
         ids. Task lines in /today, /tomorrow, /week and the daily
         reminder show the assignee; mapped names become clickable
         mentions. Names are matched case-insensitively; unmapped
-        assignees are shown as plain text. Keys must not contain ";"
-        or "=". Leave empty (the default) to show plain assignee names
-        only. Can also be set via the secrets environment file instead,
-        in which case leave this option empty.
+        assignees are shown as plain text. Names and values must each
+        be unique (compared case-insensitively) — a duplicate aborts
+        startup with exit code 2. Keys must not contain ";" or "=".
+        Leave empty (the default) to show plain assignee names only.
+        Can also be set via the secrets environment file instead, in
+        which case leave this option empty.
       '';
     };
 

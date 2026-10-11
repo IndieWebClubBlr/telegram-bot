@@ -403,6 +403,17 @@ class TodoistClient:
                 (time.monotonic() - started) * 1000,
             )
             raise TodoistError("Could not reach the Todoist API") from exc
+        except Exception as exc:
+            # Like _refresh_collaborators, treat an unexpected SDK
+            # response shape as a TodoistError so the friendly
+            # "⚠ … — send /today or /mine to refresh" path handles it
+            # instead of surfacing as "Unexpected error".
+            logger.debug(
+                "todoist %s failed in %.0fms: unexpected response",
+                label,
+                (time.monotonic() - started) * 1000,
+            )
+            raise TodoistError("Unexpected Todoist API response") from exc
         logger.debug(
             "todoist %s ok in %.0fms (%d item(s))",
             label,
