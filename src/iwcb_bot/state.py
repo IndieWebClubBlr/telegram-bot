@@ -17,6 +17,23 @@ T = TypeVar("T")
 _CHAT_LIST_KEY = "list"
 _MINE_LISTS_KEY = "mine"
 
+
+class _UnsetType:
+    """Marker distinguishing "parameter not mentioned" from None.
+
+    sync_item's due needs both: None clears a task's date (/due no
+    date), while a caller that says nothing about the date must leave
+    it alone — impossible if None doubled as both meanings.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _UnsetType()
+
 # Section headers for /mine, in budget-fill order.
 MINE_SECTIONS = (
     "\N{CALENDAR} Due",
@@ -207,15 +224,20 @@ def sync_item(
     *,
     done: bool | None = None,
     text: str | None = None,
-    due: date | None = None,
+    due: date | None | _UnsetType = UNSET,
     assignee: str | None = None,
+    recurring: bool | None = None,
 ) -> list[ListState]:
     """Apply a mutation to every stored copy of a task.
 
     The same task can appear in the chat list and in several users'
     /mine lists; each state holds its own ListItem copy, so a /done
-    anywhere must strike everywhere.  Returns the states that contained
-    the task (in input order) so the caller can re-edit their messages.
+    anywhere must strike everywhere.  due follows sentinel semantics:
+    UNSET (the default) leaves the date alone, a date sets it, and
+    None clears it (/due no date).  recurring is passed by /due, which
+    can flip a task between one-off and a series.  Returns the states
+    that contained the task (in input order) so the caller can re-edit
+    their messages.
     """
     touched: list[ListState] = []
     for state in states:
@@ -226,10 +248,12 @@ def sync_item(
                 item.done = done
             if text is not None:
                 item.text = text
-            if due is not None:
+            if not isinstance(due, _UnsetType):
                 item.due = due
             if assignee is not None:
                 item.assignee = assignee
+            if recurring is not None:
+                item.recurring = recurring
             touched.append(state)
             break
     return touched

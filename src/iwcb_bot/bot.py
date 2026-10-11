@@ -25,6 +25,7 @@ from todoist_api_python.models import Project
 
 from .config import Config
 from .state import (
+    UNSET,
     ListItem,
     ListState,
     active_states,
@@ -109,14 +110,15 @@ Commands (project: {project}):
 /undo <id> — reopen a task completed via /done (not recurring)
 /edit <id> <new text> — edit the task with that id
 /assign <id> <assignee> — assign to a Telegram @handle or Todoist name
+/due <id> <when> — change when a task is due ("tomorrow 5pm", "no date")
 /project — link to this project in Todoist
 /start or /help — this message
 
 - ids are shown in lowercase and matched case-insensitively
-- {list_cmds} or /mine show lists that /done, /undo, /edit and /assign
-  act on; edits appear in those messages only — refresh to re-fetch
-- /done, /undo, /edit and /assign sync across your /mine list and the
-  chat list
+- {list_cmds} or /mine show lists that /done, /undo, /edit, /assign and
+  /due act on; edits appear in those messages only — refresh to re-fetch
+- /done, /undo, /edit, /assign and /due sync across your /mine list
+  and the chat list
 - /add refreshes the shown list when the new task falls inside its range
 """.replace("{list_cmds}", _LIST_CMDS)
 
@@ -909,7 +911,15 @@ def build_application(
                     logger.warning("could not read next occurrence of %s", task_id)
             # Strike the copy in every stored list (chat + any /mine),
             # showing the rolled occurrence's date for recurring tasks.
-            touched = sync_item(mutation, task_id, done=True, due=next_due)
+            # due follows sentinel semantics: UNSET leaves the date
+            # alone — a bare done=True must not clear the line — while
+            # a rolled recurring date replaces it.
+            touched = sync_item(
+                mutation,
+                task_id,
+                done=True,
+                due=next_due if next_due is not None else UNSET,
+            )
             logger.debug(
                 "cmd_done task=%s: completed, synced %d list copy(ies)",
                 task_id,
@@ -1144,6 +1154,78 @@ def build_application(
             mention = _assignee_suffix(assignee_name, mentions).removeprefix(" — ")
             await _reply_html(update, f"👤 {_render_text(item.text)} → {mention}")
 
+    async def cmd_due(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if chat is None or user is None:
+            return
+        raw = " ".join(context.args or []).strip()
+        query, separator, raw_when = raw.partition(" ")
+        if not separator or not raw_when.strip():
+            await _reply(
+                update,
+                "Usage: /due <id> <when> — e.g. /due 5c tomorrow 5pm, "
+                "/due 5c next monday or /due 5c no date",
+            )
+            return
+        async with _chat_lock(chat.id):
+            states = await _require_states(update, context, user.id)
+            if states is None:
+                return
+            folded = query.casefold()
+            resolved = _resolve_query(states, folded)
+            if not resolved:
+                logger.debug("cmd_due: no match (%d state(s))", len(states))
+                await _reply(update, "No match in the last shown list")
+                return
+            if len(resolved) > 1:
+                logger.debug("cmd_due: ambiguous, %d matches", len(resolved))
+                await _reply(
+                    update,
+                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
+                )
+                return
+            task_id = resolved[0]
+            item = _find_item(states, task_id)
+            assert item is not None  # resolved from the same union
+            if any_done(states, task_id):
+                logger.debug("cmd_due task=%s: already done, refusing", task_id)
+                await _reply(update, "Already completed — can't reschedule")
+                return
+            when = raw_when.strip()
+            if len(when) > 150:
+                # Reject rather than truncate: a cut natural-language
+                # string can parse to a valid but *different* date.
+                await _reply(update, "Date string too long — max 150 characters")
+                return
+            # Todoist's server-side parser resolves the string (same
+            # parser as quick-add); garbled input comes back as a
+            # TodoistError below.
+            try:
+                updated = await todoist.update_task_due(task_id, when)
+            except TodoistError as exc:
+                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
+                return
+            day = effective_day(updated.due, updated.deadline, cfg.resolved_timezone)
+            is_recurring = bool(updated.due and updated.due.is_recurring)
+            logger.debug(
+                "cmd_due task=%s: day=%s recurring=%s", task_id, day, is_recurring
+            )
+            touched = sync_item(
+                _mutation_states(context, states),
+                task_id,
+                due=day,
+                recurring=is_recurring,
+            )
+            await _edit_states(update, context, touched, mentions)
+            if day is None:
+                await _reply_html(update, f"📅 {_render_text(item.text)} → no date")
+            else:
+                await _reply_html(
+                    update,
+                    f"📅 {_render_text(item.text)} → {_fmt_due(day, cfg.today())}",
+                )
+
     async def cmd_mine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """The sender's own tasks: due, then upcoming, then undated."""
         chat = update.effective_chat
@@ -1317,6 +1399,9 @@ def build_application(
     )
     application.add_handler(
         CommandHandler("assign", guarded(cmd_assign, typing=True), filters=auth)
+    )
+    application.add_handler(
+        CommandHandler("due", guarded(cmd_due, typing=True), filters=auth)
     )
     application.add_handler(
         CommandHandler("project", guarded(cmd_project), filters=auth)

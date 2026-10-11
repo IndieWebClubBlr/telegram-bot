@@ -21,6 +21,7 @@ All commands operate on the configured project only.
 | `/undo <id>` | Reopen a task completed with `/done` from the last shown list or your `/mine` list, un-striking it in every list that shows it. Refuses recurring tasks — completing one rolls it to its next occurrence |
 | `/edit <id> <new text>` | Edit the task whose ID ends with `<id>` from the last shown list or your `/mine` list; the new text appears in every list that shows the task. Already-completed tasks are refused. The text is stored verbatim — quick-add parsing (dates, `p1`, `@labels`) happens only on creation (`/add`), so those tokens become part of the task name. Recurring: the new name applies to all occurrences. Max 500 characters |
 | `/assign <id> <assignee>` | Assign the task whose ID ends with `<id>` to a project collaborator. The assignee is a Telegram `@handle` (resolved through `ASSIGNEE_MENTIONS`, with or without the `@`), a numeric Telegram id from the same mapping, or a Todoist collaborator name (`Priya Singh` — multi-word names work). The new assignee appears in every list that shows the task, and mapped names render as clickable mentions. Already-completed tasks are refused; a handle shared by several collaborators is ambiguous — use the full Todoist name. Clearing an assignee is not supported (Todoist UI only) |
+| `/due <id> <when>` | Change when the task whose ID ends with `<id>` is due. `<when>` is any Todoist natural-language date — `tomorrow`, `next monday 5pm`, `every friday`, or `no date` to clear — parsed by Todoist's own server-side parser (the same one quick-add uses); the reply echoes what was understood (`📅 buy milk → Fri 17 Oct`). Works on recurring tasks (updates the pattern). Already-completed tasks are refused. Max 150 characters |
 | `/project` | Link to the configured project in Todoist |
 
 Only chats listed in `ALLOWED_CHAT_IDS` are served; everyone else is ignored.
@@ -48,7 +49,7 @@ refuses them instead of reporting a false success; bring the occurrence back
 by rescheduling in Todoist.
 
 While a command is talking to Todoist (`/add`, `/today`, `/tomorrow`, `/week`,
-`/mine`, `/done`, `/undo`, `/edit`), Telegram shows the bot typing until the reply arrives.
+`/mine`, `/done`, `/undo`, `/edit`, `/assign`, `/due`), Telegram shows the bot typing until the reply arrives.
 
 ## Daily morning list
 

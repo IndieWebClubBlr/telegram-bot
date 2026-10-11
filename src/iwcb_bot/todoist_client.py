@@ -327,6 +327,19 @@ class TodoistClient:
             "update_task", self._api.update_task(task_id, assignee_id=assignee_id)
         )
 
+    async def update_task_due(self, task_id: str, due_string: str) -> Task:
+        """Reschedule a task from a natural-language string.
+
+        Parsing happens server-side (Todoist's own parser — the same
+        one quick-add uses), so "tomorrow 5pm", "next monday",
+        "every friday" and "no date" all work; garbled input surfaces
+        as a TodoistError from the API.  Max 150 chars (API limit).
+        """
+        return await self._run(
+            "update_task",
+            self._api.update_task(task_id, due_string=due_string[:150]),
+        )
+
     async def complete_task(self, task_id: str) -> None:
         closed = await self._run("complete_task", self._api.complete_task(task_id))
         if not closed:

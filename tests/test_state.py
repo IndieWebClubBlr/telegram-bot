@@ -280,6 +280,28 @@ class TestSyncItem:
         assert item.text == "new"
         assert item.due == date(2026, 10, 12)
 
+    def test_due_none_clears_date(self) -> None:
+        # /due <id> no date — explicit None means "clear", not "leave".
+        item = ListItem(task_id="ab", text="t", due=TODAY)
+        state = _state(items=[item])
+        sync_item([state], "ab", due=None)
+        assert item.due is None
+
+    def test_due_default_leaves_date_alone(self) -> None:
+        # A caller that says nothing about the date (e.g. /done on a
+        # non-recurring task) must not clear it.
+        item = ListItem(task_id="ab", text="t", due=TODAY)
+        state = _state(items=[item])
+        sync_item([state], "ab", done=True)
+        assert item.due == TODAY
+
+    def test_done_with_rolled_due_sets_both(self) -> None:
+        item = ListItem(task_id="ab", text="t", due=TODAY)
+        state = _state(items=[item])
+        sync_item([state], "ab", done=True, due=date(2026, 10, 17))
+        assert item.done is True
+        assert item.due == date(2026, 10, 17)
+
     def test_none_fields_leave_copies_alone(self) -> None:
         item = ListItem(task_id="ab", text="t", due=TODAY, done=False)
         state = _state(items=[item])
@@ -309,6 +331,26 @@ class TestSyncItem:
         state = _state(items=[item])
         sync_item([state], "ab", assignee=None)
         assert item.assignee == "Old Name"
+
+    def test_recurring_flipped_on(self) -> None:
+        # /due 5c every friday on a one-off — the flag must follow, or
+        # later /done skips the roll fetch and /undo misses its guard.
+        item = ListItem(task_id="ab", text="t", due=TODAY, recurring=False)
+        state = _state(items=[item])
+        sync_item([state], "ab", recurring=True)
+        assert item.recurring is True
+
+    def test_recurring_flipped_off(self) -> None:
+        item = ListItem(task_id="ab", text="t", due=TODAY, recurring=True)
+        state = _state(items=[item])
+        sync_item([state], "ab", recurring=False)
+        assert item.recurring is False
+
+    def test_recurring_default_leaves_flag_alone(self) -> None:
+        item = ListItem(task_id="ab", text="t", due=TODAY, recurring=True)
+        state = _state(items=[item])
+        sync_item([state], "ab", done=True)
+        assert item.recurring is True
 
 
 class TestAnyDone:
