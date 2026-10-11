@@ -48,14 +48,16 @@ While a command is talking to Todoist (`/add`, `/today`, `/tomorrow`, `/week`,
 ## Daily morning list
 
 Unless disabled with `MORNING_ANNOUNCE_TIME=off`, the bot proactively sends
-the day's task list (same rendering as `/today`) to every allowed chat at the
-configured wall-clock time (default 09:00) in the `TIMEZONE` zone. The sent
-list becomes that chat's last shown list — `/done`, `/undo` and `/edit` work
-on it immediately, no fresh `/today` needed. In forum groups the message lands
-in the General topic (commands still answer in their own topic). An empty day
-gets "Nothing due today 🎉"; a Todoist failure is reported in-chat so silence
-is never mistaken for "nothing due". If the bot is down at the scheduled time,
-the list is not re-sent until the next day.
+the day's task list — titled **Daily Task Reminder**, otherwise same rendering
+as `/today` — to every allowed chat at the configured wall-clock time
+(default 09:00) in the `TIMEZONE` zone. The sent list becomes that chat's last
+shown list — `/done`, `/undo` and `/edit` work on it immediately, no fresh
+`/today` needed, and the title stays visible as lines are struck. In forum
+groups the message lands in the General topic (commands still answer in their
+own topic). An empty day gets the title over "Nothing due today 🎉"; a Todoist
+failure is reported in-chat so silence is never mistaken for "nothing due".
+If the bot is down at the scheduled time, the list is not re-sent until the
+next day.
 
 ## Configuration
 

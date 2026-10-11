@@ -38,6 +38,7 @@ _BODY_LIMIT = 3500
 _TYPING_INTERVAL = 4.0
 _NBSP = "\N{NO-BREAK SPACE}"
 _LIST_CMDS = "/today, /tomorrow or /week"
+_MORNING_TITLE = "<b>Daily Task Reminder</b>"
 
 # Every read-modify-write of a chat's list state holds this chat's lock:
 # updates are processed sequentially, so the only concurrent writer is
@@ -467,16 +468,21 @@ async def _send_morning_list(
 ) -> None:
     """Send the morning list to one chat and store it as that chat's state.
 
-    Same rendering as /today; the message becomes the last shown list,
-    so /done, /undo and /edit work on it immediately.  Sent to the chat
-    root (no message_thread_id → the General topic in forum groups).
-    Caller holds the chat lock.
+    Same rendering as /today under a "Daily Task Reminder" title; the
+    message becomes the last shown list, so /done, /undo and /edit work
+    on it immediately (the title survives strikes via the stored
+    headline).  Sent to the chat root (no message_thread_id → the
+    General topic in forum groups).  Caller holds the chat lock.
     """
     chat_data = application.chat_data[chat_id]
-    chunks, items = _render_list_message(tasks, today, cutoff)
+    chunks, items = _render_list_message(tasks, today, cutoff, headline=_MORNING_TITLE)
     if not chunks:
         _set_state(chat_data, None)
-        await application.bot.send_message(chat_id=chat_id, text="Nothing due today 🎉")
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=f"{_MORNING_TITLE}\n\nNothing due today 🎉",
+            parse_mode=ParseMode.HTML,
+        )
         return
     first = await application.bot.send_message(
         chat_id=chat_id, text=chunks[0], parse_mode=ParseMode.HTML
@@ -493,7 +499,7 @@ async def _send_morning_list(
             day=today,
             cutoff=cutoff,
             items=items,
-            headline=None,
+            headline=_MORNING_TITLE,
         ),
     )
 
