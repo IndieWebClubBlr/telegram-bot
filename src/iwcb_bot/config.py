@@ -21,6 +21,9 @@ class Config:
     # Wall-clock time of the daily morning list in resolved_timezone;
     # None disables the morning announcement (MORNING_ANNOUNCE_TIME=off).
     morning_announce_time: time | None
+    # Todoist assignee name → Telegram mention target (@handle or
+    # numeric user id), from ASSIGNEE_MENTIONS.
+    assignee_mentions: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -32,6 +35,7 @@ class Config:
             allowed_chat_ids=_parse_chat_ids(_require(env, "ALLOWED_CHAT_IDS")),
             timezone=_parse_timezone(env),
             morning_announce_time=_parse_morning_time(env),
+            assignee_mentions=_parse_assignee_mentions(env),
         )
 
     def today(self) -> date:
@@ -89,6 +93,43 @@ def _parse_morning_time(env: Mapping[str, str]) -> time | None:
             f"MORNING_ANNOUNCE_TIME is not an HH:MM time or 'off': {raw!r} "
             "(expected e.g. 09:00)"
         ) from exc
+
+
+def _parse_assignee_mentions(env: Mapping[str, str]) -> dict[str, str]:
+    """ASSIGNEE_MENTIONS: ';'-separated 'Todoist Name=@handle' pairs.
+
+    The target is a Telegram @username or a numeric user id.  Names are
+    matched case-insensitively against Todoist collaborator names at
+    render time.  Duplicate names: last pair wins.
+    """
+    raw = env.get("ASSIGNEE_MENTIONS", "").strip()
+    if not raw:
+        return {}
+    mentions: dict[str, str] = {}
+    for part in raw.split(";"):
+        pair = part.strip()
+        if not pair:
+            continue
+        name, separator, target = pair.partition("=")
+        name = name.strip()
+        target = target.strip()
+        is_handle = (
+            target.startswith("@")
+            and len(target) > 1
+            and all(c.isalnum() or c == "_" for c in target[1:])
+        )
+        if not separator or not name:
+            raise ConfigError(
+                f"ASSIGNEE_MENTIONS entry is not 'Name=target': {pair!r} "
+                "(expected e.g. 'Abhinav Nair=@abnv')"
+            )
+        if not is_handle and not target.isdigit():
+            raise ConfigError(
+                f"ASSIGNEE_MENTIONS target is not an @handle or numeric id: "
+                f"{target!r} (in entry {pair!r})"
+            )
+        mentions[name] = target
+    return mentions
 
 
 def _parse_chat_ids(value: str) -> frozenset[int]:

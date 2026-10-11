@@ -21,6 +21,13 @@ let
       MORNING_ANNOUNCE_TIME=${cfg.morningAnnounceTime}
     ''
     + lib.optionalString (cfg.timeZone != null) "TIMEZONE=${cfg.timeZone}\n"
+    + lib.optionalString (cfg.assigneeMentions != { }) (
+      "ASSIGNEE_MENTIONS=${
+        lib.concatStringsSep ";" (
+          lib.mapAttrsToList (name: target: "${name}=${target}") cfg.assigneeMentions
+        )
+      }\n"
+    )
   );
 in
 {
@@ -82,6 +89,26 @@ in
       '';
     };
 
+    assigneeMentions = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.strMatching "(@[A-Za-z0-9_]+|[0-9]+)");
+      default = { };
+      example = {
+        "Abhinav Nair" = "@abnv";
+        "Priya Singh" = "123456789";
+      };
+      description = ''
+        Mapping of Todoist collaborator names to Telegram mentions
+        (ASSIGNEE_MENTIONS): values are @usernames or numeric user
+        ids. Task lines in /today, /tomorrow, /week and the daily
+        reminder show the assignee; mapped names become clickable
+        mentions. Names are matched case-insensitively; unmapped
+        assignees are shown as plain text. Keys must not contain ";"
+        or "=". Leave empty (the default) to show plain assignee names
+        only. Can also be set via the secrets environment file instead,
+        in which case leave this option empty.
+      '';
+    };
+
     environmentFile = lib.mkOption {
       type = lib.types.str;
       example = "/run/secrets-rendered/iwcb-bot.env";
@@ -103,6 +130,12 @@ in
       {
         assertion = lib.hasPrefix "/" cfg.environmentFile;
         message = ''services.iwcb-telegram-bot.environmentFile must be an absolute path string, e.g. "/run/secrets-rendered/iwcb-bot.env"'';
+      }
+      {
+        assertion = lib.all (name: !(lib.hasInfix ";" name || lib.hasInfix "=" name)) (
+          lib.attrNames cfg.assigneeMentions
+        );
+        message = ''services.iwcb-telegram-bot.assigneeMentions keys must not contain ";" or "=" (they would break the ASSIGNEE_MENTIONS env encoding)'';
       }
     ];
 

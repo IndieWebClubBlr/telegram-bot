@@ -60,9 +60,12 @@ def main() -> None:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    logging.getLogger().addFilter(
-        _SecretRedactionFilter((cfg.telegram_token, cfg.todoist_token))
-    )
+    # Handler filters run for records propagated from child loggers
+    # (e.g. PTB's bootstrap networkloop, which logs the token on a
+    # rejected login); a logger filter would miss those entirely.
+    secret_filter = _SecretRedactionFilter((cfg.telegram_token, cfg.todoist_token))
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(secret_filter)
 
     todoist = TodoistClient(cfg.todoist_token, cfg.resolved_timezone)
     try:

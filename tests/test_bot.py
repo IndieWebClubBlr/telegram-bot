@@ -7,11 +7,13 @@ import pytest
 from todoist_api_python.models import Deadline, Due
 
 from iwcb_bot.bot import (
+    _assignee_suffix,
     _BODY_LIMIT,
     _chunk,
     _fmt_due,
     _ListItem,
     _md_html,
+    _mentions_lookup,
     _NBSP,
     _next_announce,
     _one_line,
@@ -502,3 +504,70 @@ class TestNextAnnounce:
         assert target == datetime(2026, 3, 8, 9, 0, tzinfo=new_york)
         assert target.utcoffset() == timedelta(hours=-4)
         assert target.timestamp() - now.timestamp() == 12 * 3600.0
+
+
+class TestMentionsLookup:
+    def test_casefolds_names(self) -> None:
+        cfg = _config(assignee_mentions={"Abhinav Nair": "@abnv"})
+        assert _mentions_lookup(cfg) == {"abhinav nair": "@abnv"}
+
+    def test_empty_by_default(self) -> None:
+        assert _mentions_lookup(_config()) == {}
+
+
+class TestAssigneeSuffix:
+    _MENTIONS = {"abhinav nair": "@abnv", "priya singh": "123456789"}
+
+    def test_unassigned_renders_nothing(self) -> None:
+        assert _assignee_suffix(None, self._MENTIONS) == ""
+
+    def test_mapped_handle_renders_handle(self) -> None:
+        assert _assignee_suffix("Abhinav Nair", self._MENTIONS) == " — @abnv"
+
+    def test_mapped_id_renders_tg_mention(self) -> None:
+        assert (
+            _assignee_suffix("Priya Singh", self._MENTIONS)
+            == ' — <a href="tg://user?id=123456789">Priya Singh</a>'
+        )
+
+    def test_unmapped_name_renders_escaped_text(self) -> None:
+        assert _assignee_suffix("A&B C", self._MENTIONS) == " — A&amp;B C"
+
+    def test_lookup_is_case_insensitive(self) -> None:
+        assert _assignee_suffix("ABHINAV NAIR", self._MENTIONS) == " — @abnv"
+
+    def test_name_html_escaped_in_tg_mention(self) -> None:
+        mentions = {"a&b": "1"}
+        assert (
+            _assignee_suffix("A&B", mentions)
+            == ' — <a href="tg://user?id=1">A&amp;B</a>'
+        )
+
+
+class TestRenderListAssignee:
+    _ITEM = _ListItem(
+        task_id="62ab",
+        text="buy milk",
+        due=date(2026, 10, 9),
+        assignee="Abhinav Nair",
+    )
+
+    def test_assignee_between_text_and_due(self) -> None:
+        rendered = _render_list(
+            [self._ITEM],
+            date(2026, 10, 9),
+            show_dates=True,
+            mentions={"abhinav nair": "@abnv"},
+        )
+        assert rendered == "<code>[ab]</code>  buy milk — @abnv — due Fri 9 Oct"
+
+    def test_no_mentions_map_shows_plain_name(self) -> None:
+        rendered = _render_list([self._ITEM], date(2026, 10, 9), show_dates=False)
+        assert "buy milk — Abhinav Nair" in rendered
+
+    def test_unassigned_has_no_suffix(self) -> None:
+        item = _ListItem(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
+        rendered = _render_list(
+            [item], date(2026, 10, 9), show_dates=False, mentions={"x": "@y"}
+        )
+        assert rendered == "<code>[ab]</code>  buy milk"

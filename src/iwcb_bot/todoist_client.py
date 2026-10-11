@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass
@@ -73,6 +74,16 @@ class TodoistClient:
     def __init__(self, token: str, timezone: tzinfo) -> None:
         self._api = TodoistAPIAsync(token)
         self._timezone = timezone
+        # Project collaborator id → name, fetched once on first need and
+        # cached.  _collaborator_misses remembers ids that were looked
+        # for in a *successful* refresh and still not found (e.g. a
+        # removed collaborator), so a stale id cannot trigger a refetch
+        # loop.  _collaborator_lock makes the fetch single-flight: the
+        # morning-announce task can race a handler, and both must not
+        # fetch the same list concurrently.
+        self._collaborators: dict[str, str] | None = None
+        self._collaborator_misses: set[str] = set()
+        self._collaborator_lock = asyncio.Lock()
 
     async def close(self) -> None:
         # The async wrapper's __aexit__ is a docstring-only no-op; the
@@ -84,6 +95,60 @@ class TodoistClient:
             closer(None, None, None)
         else:
             self._api.__aexit__(None, None, None)
+
+    async def warm_collaborators(self, project_id: str) -> None:
+        """Fetch the collaborator list now, unless it is already cached.
+
+        Lets callers (the morning loop) do the chat-independent network
+        work once per cycle outside any per-chat lock; later
+        collaborator_name calls then hit the cache.
+        """
+        async with self._collaborator_lock:
+            if self._collaborators is None:
+                await self._refresh_collaborators(project_id)
+
+    async def collaborator_name(self, project_id: str, assignee_id: str) -> str | None:
+        """Display name for a Todoist assignee id, or None.
+
+        The collaborator list is fetched once and cached; an id not in
+        the cache triggers one refresh (a new collaborator), after which
+        an id that is still missing is treated as unresolvable.  API
+        failures are logged and degrade to None — assignee display is
+        cosmetic and must never break list rendering — and the failed
+        attempt is not recorded, so the next call retries.
+        """
+        async with self._collaborator_lock:
+            if self._collaborators is None:
+                await self._refresh_collaborators(project_id)
+            if self._collaborators is None:
+                # First fetch failed (offline, 403, rate limit, …) —
+                # degrade to None, never crash the caller; the next
+                # call retries.
+                return None
+            name = self._collaborators.get(assignee_id)
+            if name is not None or assignee_id in self._collaborator_misses:
+                return name
+            await self._refresh_collaborators(project_id)
+            name = self._collaborators.get(assignee_id)
+            # Only a *successful* refresh that lacks the id retires it;
+            # on failure _collaborators was left as-is and the next call
+            # retries instead of poisoning the lookup for the process
+            # lifetime.
+            if self._collaborators is not None:
+                self._collaborator_misses.add(assignee_id)
+            return name
+
+    async def _refresh_collaborators(self, project_id: str) -> None:
+        try:
+            collaborators = await self._pages(self._api.get_collaborators(project_id))
+        except Exception:
+            # Catches everything the SDK or pagination can raise
+            # (TodoistError, HTTPError, TypeError on an unexpected
+            # response shape, …) — a cosmetic feature must never break
+            # list rendering or the morning cycle.
+            logger.exception("could not load project collaborators")
+            return
+        self._collaborators = {c.id: c.name for c in collaborators}
 
     async def resolve_project(self, project_id: str) -> Project:
         try:

@@ -77,6 +77,59 @@ class TestTimezone:
         assert cfg.today() == expected
 
 
+class TestAssigneeMentions:
+    def test_empty_by_default(self) -> None:
+        assert make_config().assignee_mentions == {}
+
+    def test_blank_is_empty(self) -> None:
+        assert make_config(ASSIGNEE_MENTIONS="  ").assignee_mentions == {}
+
+    def test_single_handle(self) -> None:
+        cfg = make_config(ASSIGNEE_MENTIONS="Abhinav Nair=@abnv")
+        assert cfg.assignee_mentions == {"Abhinav Nair": "@abnv"}
+
+    def test_numeric_id(self) -> None:
+        cfg = make_config(ASSIGNEE_MENTIONS="Priya Singh=123456789")
+        assert cfg.assignee_mentions == {"Priya Singh": "123456789"}
+
+    def test_multiple_pairs_and_whitespace(self) -> None:
+        cfg = make_config(
+            ASSIGNEE_MENTIONS=" Abhinav Nair = @abnv ; Priya Singh = 123 "
+        )
+        assert cfg.assignee_mentions == {
+            "Abhinav Nair": "@abnv",
+            "Priya Singh": "123",
+        }
+
+    def test_trailing_semicolon_ignored(self) -> None:
+        cfg = make_config(ASSIGNEE_MENTIONS="A B=@ab;")
+        assert cfg.assignee_mentions == {"A B": "@ab"}
+
+    def test_duplicate_name_last_wins(self) -> None:
+        cfg = make_config(ASSIGNEE_MENTIONS="A B=@first;A B=@second")
+        assert cfg.assignee_mentions == {"A B": "@second"}
+
+    def test_handle_allows_underscores_and_digits(self) -> None:
+        cfg = make_config(ASSIGNEE_MENTIONS="N=@n_9x")
+        assert cfg.assignee_mentions == {"N": "@n_9x"}
+
+    def test_bad_target_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="not an @handle or numeric id"):
+            make_config(ASSIGNEE_MENTIONS="A B=@bad-target")
+
+    def test_missing_equals_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Name=target"):
+            make_config(ASSIGNEE_MENTIONS="A B")
+
+    def test_empty_name_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="Name=target"):
+            make_config(ASSIGNEE_MENTIONS=" =@abnv")
+
+    def test_lone_at_sign_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="not an @handle or numeric id"):
+            make_config(ASSIGNEE_MENTIONS="A B=@")
+
+
 class TestMorningAnnounceTime:
     def test_unset_defaults_to_9am(self) -> None:
         assert make_config().morning_announce_time == time(9, 0)

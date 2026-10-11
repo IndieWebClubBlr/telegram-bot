@@ -63,7 +63,7 @@ next day.
 
 Four variables are required — the bot exits with a clear error if any is
 missing (exit code 2; the NixOS unit does not restart on configuration
-errors) — plus one optional:
+errors) — plus a few optional ones:
 
 | Variable | Meaning |
 | --- | --- |
@@ -73,6 +73,15 @@ errors) — plus one optional:
 | `ALLOWED_CHAT_IDS` | Comma-separated Telegram chat IDs allowed to use the bot. Group IDs are negative (e.g. `-1001234567890`) — learn one by forwarding a group message to an ID-reporting bot such as [@getidsbot](https://t.me/getidsbot) |
 | `TIMEZONE` | Optional IANA time zone for the bot's "today" calculations (e.g. `Asia/Kolkata`). The server and the bot's users are often in different time zones, so set this explicitly; an invalid value aborts startup with exit code 2. Falls back to the server's local time zone. Naive due datetimes (the normal Todoist shape) are taken as wall-clock times in this zone; timezone-aware dues are converted into it before the calendar day is taken |
 | `MORNING_ANNOUNCE_TIME` | Optional wall-clock time (24h `HH:MM`, in the `TIMEZONE` zone) at which the bot proactively sends the day's task list to every allowed chat. Defaults to `09:00`; set to `off` to disable. An invalid value aborts startup with exit code 2 |
+| `ASSIGNEE_MENTIONS` | Optional `;`-separated `Todoist Name=Telegram` pairs mapping shared-project assignee names to Telegram mentions — `Abhinav Nair=@abnv;Priya Singh=123456789`. Names match case-insensitively; mapped names render as clickable mentions, unmapped assignees as plain text, unassigned tasks show no suffix. An invalid value aborts startup with exit code 2 |
+
+## Assignees
+
+Task lines in `/today`, `/tomorrow`, `/week` and the daily reminder show
+the Todoist assignee between the task text and the due date, e.g.
+`[ab]  buy milk — @abnv — due Tue 9 Oct`. The project's collaborator
+list is fetched once on first need and cached; an unknown assignee id
+(e.g. a collaborator added after startup) triggers one refresh.
 
 ## Local development
 

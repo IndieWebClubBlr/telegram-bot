@@ -268,6 +268,30 @@ class _ListItem:
     due: date
     done: bool = False
     recurring: bool = False
+    assignee: str | None = None
+
+
+def _mentions_lookup(cfg: Config) -> dict[str, str]:
+    """Casefolded Todoist-name → Telegram mention target mapping."""
+    return {name.casefold(): target for name, target in cfg.assignee_mentions.items()}
+
+
+def _assignee_suffix(name: str | None, mentions: dict[str, str]) -> str:
+    """Line suffix for an assignee: mention, handle, or plain name.
+
+    mentions maps casefolded Todoist collaborator names to a Telegram
+    @handle (auto-linked by Telegram) or a numeric user id (rendered as
+    a clickable tg:// mention).  Unmapped names render as escaped plain
+    text so ownership stays visible; unassigned tasks get nothing.
+    """
+    if name is None:
+        return ""
+    target = mentions.get(name.casefold())
+    if target is None:
+        return f" — {html.escape(name)}"
+    if target.startswith("@"):
+        return f" — {target}"
+    return f' — <a href="tg://user?id={target}">{html.escape(name)}</a>'
 
 
 @dataclass
@@ -298,14 +322,23 @@ def _task_suffixes(task_ids: list[str]) -> list[str]:
     return suffixes
 
 
-def _render_list(items: list[_ListItem], today: date, *, show_dates: bool) -> str:
+def _render_list(
+    items: list[_ListItem],
+    today: date,
+    *,
+    show_dates: bool,
+    mentions: dict[str, str] | None = None,
+) -> str:
     """Render the task list body (no headline).
 
     With show_dates (used by /tomorrow and /week) every line carries its
     due date so multi-day lists are readable; /today only dates overdue
     lines.  Done items keep their date in multi-day lists too — the
-    strike-through already marks them.
+    strike-through already marks them.  Assignees (resolved at fetch
+    time) render between the task text and the due suffix.
     """
+    if mentions is None:
+        mentions = {}
     suffixes = _task_suffixes([item.task_id for item in items])
     width = max((len(suffix) for suffix in suffixes), default=0)
     lines: list[str] = []
@@ -315,41 +348,64 @@ def _render_list(items: list[_ListItem], today: date, *, show_dates: bool) -> st
         if item.done:
             body = f"<s>{body}</s>"
         padded = suffix.ljust(width, _NBSP)
-        line = f"<code>[{padded}]</code>  {marker}{body}"
+        line = (
+            f"<code>[{padded}]</code>  {marker}{body}"
+            f"{_assignee_suffix(item.assignee, mentions)}"
+        )
         if show_dates or (item.due < today and not item.done):
             line += f" — due {_fmt_due(item.due, today)}"
         lines.append(line)
     return "\n".join(lines)
 
 
+async def _build_items(
+    tasks: list[DueTask], todoist: TodoistClient, project_id: str
+) -> list[_ListItem]:
+    """State items for fetched tasks, resolving assignee display names.
+
+    Assignee resolution goes through the client's cached collaborator
+    map (fetched once, refreshed on unknown ids) and never raises — a
+    failed lookup leaves the assignee blank.
+    """
+    items: list[_ListItem] = []
+    for task in tasks:
+        assignee: str | None = None
+        if task.task.assignee_id:
+            assignee = await todoist.collaborator_name(
+                project_id, task.task.assignee_id
+            )
+        items.append(
+            _ListItem(
+                task_id=task.task.id,
+                text=task.task.content,
+                due=task.due,
+                recurring=bool(task.task.due and task.task.due.is_recurring),
+                assignee=assignee,
+            )
+        )
+    return items
+
+
 def _render_list_message(
-    tasks: list[DueTask],
+    items: list[_ListItem],
     today: date,
     cutoff: date,
+    mentions: dict[str, str],
     headline: str | None = None,
-) -> tuple[list[str], list[_ListItem]]:
-    """Render tasks into sendable chunks plus the state items.
+) -> list[str]:
+    """Render state items into sendable chunks.
 
-    Returns ([], []) for an empty list — the caller decides the empty
-    reply (handlers and the morning loop word it slightly differently).
+    Returns [] for an empty list — the caller decides the empty reply
+    (handlers and the morning loop word it slightly differently).
     """
-    if not tasks:
-        return [], []
-    items = [
-        _ListItem(
-            task_id=task.task.id,
-            text=task.task.content,
-            due=task.due,
-            recurring=bool(task.task.due and task.task.due.is_recurring),
-        )
-        for task in tasks
-    ]
-    body = _render_list(items, today, show_dates=cutoff > today)
+    if not items:
+        return []
+    body = _render_list(items, today, show_dates=cutoff > today, mentions=mentions)
     if cutoff > today:
         body = f"<b>Due by {_fmt_due(cutoff, today)}:</b>\n{body}"
     if headline is not None:
         body = f"{headline}\n\n{body}"
-    return _chunk(body), items
+    return _chunk(body)
 
 
 async def _send_list(
@@ -358,6 +414,9 @@ async def _send_list(
     tasks: list[DueTask],
     today: date,
     cutoff: date,
+    mentions: dict[str, str],
+    todoist: TodoistClient,
+    project_id: str,
     headline: str | None = None,
 ) -> None:
     """Send the rendered list, optionally under an HTML headline line.
@@ -367,7 +426,8 @@ async def _send_list(
     message = update.effective_message
     if message is None:
         return
-    chunks, items = _render_list_message(tasks, today, cutoff, headline)
+    items = await _build_items(tasks, todoist, project_id)
+    chunks = _render_list_message(items, today, cutoff, mentions, headline)
     if not chunks:
         _set_state(context.chat_data, None)
         if headline is not None:
@@ -417,6 +477,7 @@ async def _edit_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     state: _ListState,
+    mentions: dict[str, str],
 ) -> None:
     """Re-render the stored list message from its state.
 
@@ -430,7 +491,9 @@ async def _edit_list(
     if chat is None:
         return
     today = state.day
-    rendered = _render_list(state.items, today, show_dates=state.cutoff > today)
+    rendered = _render_list(
+        state.items, today, show_dates=state.cutoff > today, mentions=mentions
+    )
     if state.cutoff > today:
         rendered = f"<b>Due by {_fmt_due(state.cutoff, today)}:</b>\n{rendered}"
     if state.headline is not None:
@@ -465,6 +528,9 @@ async def _send_morning_list(
     tasks: list[DueTask],
     today: date,
     cutoff: date,
+    mentions: dict[str, str],
+    todoist: TodoistClient,
+    project_id: str,
 ) -> None:
     """Send the morning list to one chat and store it as that chat's state.
 
@@ -475,7 +541,10 @@ async def _send_morning_list(
     General topic in forum groups).  Caller holds the chat lock.
     """
     chat_data = application.chat_data[chat_id]
-    chunks, items = _render_list_message(tasks, today, cutoff, headline=_MORNING_TITLE)
+    items = await _build_items(tasks, todoist, project_id)
+    chunks = _render_list_message(
+        items, today, cutoff, mentions, headline=_MORNING_TITLE
+    )
     if not chunks:
         _set_state(chat_data, None)
         await application.bot.send_message(
@@ -524,6 +593,7 @@ async def _morning_loop(
     if at is None:
         return
     tz = cfg.resolved_timezone
+    mentions = _mentions_lookup(cfg)
     logger.info("morning list scheduled daily at %s (%s)", at.strftime("%H:%M"), tz)
     while True:
         target = _next_announce(at, tz)
@@ -535,6 +605,10 @@ async def _morning_loop(
             except TodoistError:
                 logger.warning("morning fetch failed")
                 tasks = None
+            # Chat-independent: warm the assignee-name cache once per
+            # cycle, outside any chat lock (only the send and state
+            # write are locked).  Failures degrade to blank assignees.
+            await todoist.warm_collaborators(project.id)
             for chat_id in sorted(cfg.allowed_chat_ids):
                 async with _chat_lock(chat_id):
                     try:
@@ -546,7 +620,14 @@ async def _morning_loop(
                                 )
                         else:
                             await _send_morning_list(
-                                application, chat_id, tasks, today, today
+                                application,
+                                chat_id,
+                                tasks,
+                                today,
+                                today,
+                                mentions,
+                                todoist,
+                                project.id,
                             )
                     except TelegramError:
                         logger.warning("morning send failed for chat %s", chat_id)
@@ -569,6 +650,7 @@ def build_application(
     auth = (
         filters.Chat(chat_id=sorted(cfg.allowed_chat_ids)) & ~filters.UpdateType.EDITED
     )
+    mentions = _mentions_lookup(cfg)
 
     async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _HELP.format(project=project.name))
@@ -610,7 +692,17 @@ def build_application(
                     f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}",
                 )
                 return
-            await _send_list(update, context, tasks, today, cutoff, headline=headline)
+            await _send_list(
+                update,
+                context,
+                tasks,
+                today,
+                cutoff,
+                mentions,
+                todoist,
+                project.id,
+                headline=headline,
+            )
 
     def _cmd_list(days: int, name: str) -> Handler:
         async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -621,7 +713,16 @@ def build_application(
                 today = cfg.today()
                 cutoff = today + timedelta(days=days)
                 tasks = await todoist.tasks_due_by(project.id, cutoff)
-                await _send_list(update, context, tasks, today, cutoff)
+                await _send_list(
+                    update,
+                    context,
+                    tasks,
+                    today,
+                    cutoff,
+                    mentions,
+                    todoist,
+                    project.id,
+                )
 
         cmd.__name__ = name
         return guarded(cmd, typing=True)
@@ -697,7 +798,7 @@ def build_application(
                 # Show the rolled occurrence's date instead of the stale one
                 # the user just completed.
                 item.due = next_due
-            await _edit_list(update, context, state)
+            await _edit_list(update, context, state, mentions)
             if item.recurring and next_due is not None:
                 await _reply_html(
                     update,
@@ -747,7 +848,7 @@ def build_application(
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
                 return
             item.done = False
-            await _edit_list(update, context, state)
+            await _edit_list(update, context, state, mentions)
             await _reply_html(update, f"↩️ {_render_text(item.text)}")
 
     async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -791,7 +892,7 @@ def build_application(
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} to refresh")
                 return
             item.text = new_text
-            await _edit_list(update, context, state)
+            await _edit_list(update, context, state, mentions)
             await _reply_html(update, f"✏️ {_render_text(new_text)}")
 
     async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
