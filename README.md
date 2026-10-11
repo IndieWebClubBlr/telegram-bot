@@ -20,6 +20,7 @@ All commands operate on the configured project only.
 | `/done <id>` | Complete the task whose ID ends with `<id>` from the last shown list (`/today`, `/tomorrow` or `/week`) or your `/mine` list (matching is case-insensitive; the same task in both lists is one match). Strikes the line in place (lists that fit a single message) in every list that shows it — including other users' `/mine` lists — and confirms; for a recurring task the struck line shows the rolled next-occurrence date and the confirmation includes it too. A task already struck in the list is refused (completing it again would close the next occurrence of a recurring task). Stale data (task changed elsewhere) gives a safe error |
 | `/undo <id>` | Reopen a task completed with `/done` from the last shown list or your `/mine` list, un-striking it in every list that shows it. Refuses recurring tasks — completing one rolls it to its next occurrence |
 | `/edit <id> <new text>` | Edit the task whose ID ends with `<id>` from the last shown list or your `/mine` list; the new text appears in every list that shows the task. Already-completed tasks are refused. The text is stored verbatim — quick-add parsing (dates, `p1`, `@labels`) happens only on creation (`/add`), so those tokens become part of the task name. Recurring: the new name applies to all occurrences. Max 500 characters |
+| `/assign <id> <assignee>` | Assign the task whose ID ends with `<id>` to a project collaborator. The assignee is a Telegram `@handle` (resolved through `ASSIGNEE_MENTIONS`, with or without the `@`), a numeric Telegram id from the same mapping, or a Todoist collaborator name (`Priya Singh` — multi-word names work). The new assignee appears in every list that shows the task, and mapped names render as clickable mentions. Already-completed tasks are refused; a handle shared by several collaborators is ambiguous — use the full Todoist name. Clearing an assignee is not supported (Todoist UI only) |
 | `/project` | Link to the configured project in Todoist |
 
 Only chats listed in `ALLOWED_CHAT_IDS` are served; everyone else is ignored.
@@ -30,7 +31,7 @@ commands addressed to other bots (`/cmd@OtherBot`) are ignored.
 
 Task text is markdown (that's how Todoist stores it): links, **bold**,
 *italic*, ~~strike~~, `code` and bare URLs are rendered in list lines and
-in `/add`, `/done`, `/undo` and `/edit` replies.
+in `/add`, `/done`, `/undo`, `/edit` and `/assign` replies.
 
 The bot keeps all state in memory: a restart loses the saved lists, so `/done`,
 `/undo` and `/edit` need a fresh `/today`, `/tomorrow`, `/week` or `/mine`

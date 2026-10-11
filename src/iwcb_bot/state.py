@@ -208,6 +208,7 @@ def sync_item(
     done: bool | None = None,
     text: str | None = None,
     due: date | None = None,
+    assignee: str | None = None,
 ) -> list[ListState]:
     """Apply a mutation to every stored copy of a task.
 
@@ -227,6 +228,8 @@ def sync_item(
                 item.text = text
             if due is not None:
                 item.due = due
+            if assignee is not None:
+                item.assignee = assignee
             touched.append(state)
             break
     return touched
@@ -287,3 +290,27 @@ def todoist_name_for_user(
             if target.casefold() == folded:
                 return name
     return None
+
+
+def assignee_name_candidates(raw: str, mentions: dict[str, str]) -> list[str]:
+    """Todoist collaborator name(s) an /assign argument can refer to.
+
+    `mentions` is the raw ASSIGNEE_MENTIONS mapping (Todoist name →
+    @handle or numeric id).  A bare Telegram username (with or without
+    a leading @) or a numeric id is matched against the mapping's
+    targets and expands to every name configured for it (several names
+    may share one handle; the caller resolves each to a collaborator
+    and errors on genuine ambiguity).  Anything else is taken verbatim
+    as a Todoist collaborator name (e.g. "Priya Singh").  Returns []
+    for blank input.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    folded = stripped.lstrip("@").casefold()
+    matched = [
+        name
+        for name, target in mentions.items()
+        if target.lstrip("@").casefold() == folded
+    ]
+    return matched or [stripped]

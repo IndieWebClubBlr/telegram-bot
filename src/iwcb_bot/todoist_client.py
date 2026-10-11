@@ -316,6 +316,17 @@ class TodoistClient:
             "update_task", self._api.update_task(task_id, content=content)
         )
 
+    async def update_task_assignee(self, task_id: str, assignee_id: str) -> Task:
+        """Assign a task to a project collaborator.
+
+        The SDK treats assignee_id=None as "leave unchanged", so this
+        can only set an assignee — clearing one is not possible through
+        this API surface.
+        """
+        return await self._run(
+            "update_task", self._api.update_task(task_id, assignee_id=assignee_id)
+        )
+
     async def complete_task(self, task_id: str) -> None:
         closed = await self._run("complete_task", self._api.complete_task(task_id))
         if not closed:

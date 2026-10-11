@@ -8,6 +8,7 @@ from iwcb_bot.state import (
     active_states,
     all_mine_states,
     any_done,
+    assignee_name_candidates,
     displayed_matches,
     get_chat_state,
     get_mine_states,
@@ -163,6 +164,57 @@ class TestTodoistNameForUser:
         assert todoist_name_for_user(999, "jane", mentions) == "JANE DOE"
 
 
+class TestAssigneeNameCandidates:
+    _MENTIONS = {
+        "Abhinav Nair": "@abnv",
+        "Priya Singh": "123456789",
+        "Ana Diaz": "@abnv",
+    }
+
+    def test_blank_input(self) -> None:
+        assert assignee_name_candidates("   ", self._MENTIONS) == []
+
+    def test_handle_with_at(self) -> None:
+        assert assignee_name_candidates("@abnv", self._MENTIONS) == [
+            "Abhinav Nair",
+            "Ana Diaz",
+        ]
+
+    def test_handle_without_at(self) -> None:
+        assert assignee_name_candidates("abnv", self._MENTIONS) == [
+            "Abhinav Nair",
+            "Ana Diaz",
+        ]
+
+    def test_handle_case_insensitive(self) -> None:
+        assert assignee_name_candidates("@ABNV", self._MENTIONS) == [
+            "Abhinav Nair",
+            "Ana Diaz",
+        ]
+
+    def test_numeric_target(self) -> None:
+        assert assignee_name_candidates("123456789", self._MENTIONS) == ["Priya Singh"]
+
+    def test_multiword_todoist_name_passthrough(self) -> None:
+        assert assignee_name_candidates("Priya Singh", self._MENTIONS) == [
+            "Priya Singh"
+        ]
+
+    def test_unknown_handle_falls_back_to_verbatim(self) -> None:
+        # A name that merely looks unmapped is still tried as a
+        # Todoist collaborator name downstream.
+        assert assignee_name_candidates("@stranger", self._MENTIONS) == ["@stranger"]
+
+    def test_empty_mentions(self) -> None:
+        assert assignee_name_candidates("Priya Singh", {}) == ["Priya Singh"]
+
+    def test_padded_input_stripped(self) -> None:
+        assert assignee_name_candidates("  @abnv  ", self._MENTIONS) == [
+            "Abhinav Nair",
+            "Ana Diaz",
+        ]
+
+
 class TestTakeMine:
     def test_budget_fills_due_first(self) -> None:
         due = ["d1", "d2"]
@@ -234,6 +286,29 @@ class TestSyncItem:
         touched = sync_item([state], "ab")
         assert touched == [state]
         assert item.done is False and item.text == "t" and item.due == TODAY
+
+    def test_assignee_sync(self) -> None:
+        item = ListItem(task_id="ab", text="t", due=TODAY, assignee=None)
+        state = _state(items=[item])
+        touched = sync_item([state], "ab", assignee="Priya Singh")
+        assert touched == [state]
+        assert item.assignee == "Priya Singh"
+
+    def test_assignee_sync_every_copy(self) -> None:
+        item_a = ListItem(task_id="ab", text="t", due=TODAY)
+        item_b = ListItem(task_id="ab", text="t", due=TODAY)
+        state_a = _state(items=[item_a])
+        state_b = _state(items=[item_b])
+        touched = sync_item([state_a, state_b], "ab", assignee="Priya Singh")
+        assert touched == [state_a, state_b]
+        assert item_a.assignee == "Priya Singh"
+        assert item_b.assignee == "Priya Singh"
+
+    def test_assignee_none_leaves_copies_alone(self) -> None:
+        item = ListItem(task_id="ab", text="t", due=TODAY, assignee="Old Name")
+        state = _state(items=[item])
+        sync_item([state], "ab", assignee=None)
+        assert item.assignee == "Old Name"
 
 
 class TestAnyDone:

@@ -30,6 +30,7 @@ from .state import (
     active_states,
     all_mine_states,
     any_done,
+    assignee_name_candidates,
     displayed_matches,
     get_chat_state,
     resolve_ids,
@@ -107,13 +108,15 @@ Commands (project: {project}):
 /done <id> — complete the task with that id (from the last shown list)
 /undo <id> — reopen a task completed via /done (not recurring)
 /edit <id> <new text> — edit the task with that id
+/assign <id> <assignee> — assign to a Telegram @handle or Todoist name
 /project — link to this project in Todoist
 /start or /help — this message
 
 - ids are shown in lowercase and matched case-insensitively
-- {list_cmds} or /mine show lists that /done, /undo and /edit act on;
-  edits appear in those messages only — refresh to re-fetch
-- /done, /undo and /edit sync across your /mine list and the chat list
+- {list_cmds} or /mine show lists that /done, /undo, /edit and /assign
+  act on; edits appear in those messages only — refresh to re-fetch
+- /done, /undo, /edit and /assign sync across your /mine list and the
+  chat list
 - /add refreshes the shown list when the new task falls inside its range
 """.replace("{list_cmds}", _LIST_CMDS)
 
@@ -1037,6 +1040,110 @@ def build_application(
             await _edit_states(update, context, touched, mentions)
             await _reply_html(update, f"✏️ {_render_text(new_text)}")
 
+    async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if chat is None or user is None:
+            return
+        raw = " ".join(context.args or []).strip()
+        query, separator, raw_assignee = raw.partition(" ")
+        if not separator or not raw_assignee.strip():
+            await _reply(
+                update,
+                "Usage: /assign <id> <assignee> — e.g. /assign 5c @abnv "
+                "or /assign 5c Priya Singh",
+            )
+            return
+        async with _chat_lock(chat.id):
+            states = await _require_states(update, context, user.id)
+            if states is None:
+                return
+            folded = query.casefold()
+            resolved = _resolve_query(states, folded)
+            if not resolved:
+                logger.debug("cmd_assign: no match (%d state(s))", len(states))
+                await _reply(update, "No match in the last shown list")
+                return
+            if len(resolved) > 1:
+                logger.debug("cmd_assign: ambiguous, %d matches", len(resolved))
+                await _reply(
+                    update,
+                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
+                )
+                return
+            task_id = resolved[0]
+            item = _find_item(states, task_id)
+            assert item is not None  # resolved from the same union
+            if any_done(states, task_id):
+                logger.debug("cmd_assign task=%s: already done, refusing", task_id)
+                await _reply(update, "Already completed — can't assign")
+                return
+            # Raw mapping (original casing) — `mentions` here is the
+            # casefolded render lookup and would store lowercase names.
+            candidates = assignee_name_candidates(raw_assignee, cfg.assignee_mentions)
+            # Resolve every candidate name (a bare @handle can map to
+            # several Todoist names); genuine ambiguity is more than
+            # one distinct collaborator.
+            assignee_ids: list[str] = []
+            for candidate in candidates:
+                collaborator_id = await todoist.collaborator_id_for_name(
+                    project.id, candidate
+                )
+                if collaborator_id is not None and collaborator_id not in assignee_ids:
+                    assignee_ids.append(collaborator_id)
+            if not assignee_ids:
+                logger.debug(
+                    "cmd_assign task=%s: no collaborator for %d candidate(s)",
+                    task_id,
+                    len(candidates),
+                )
+                await _reply(
+                    update,
+                    f"Todoist collaborator {raw_assignee.strip()!r} not found on "
+                    "this project (or the lookup failed) — check the name or "
+                    "ASSIGNEE_MENTIONS",
+                )
+                return
+            if len(assignee_ids) > 1:
+                logger.debug(
+                    "cmd_assign task=%s: ambiguous assignee, %d collaborators",
+                    task_id,
+                    len(assignee_ids),
+                )
+                await _reply(
+                    update,
+                    f"Ambiguous — {raw_assignee.strip()!r} matches "
+                    f"{len(assignee_ids)} collaborators, use their full Todoist name",
+                )
+                return
+            collaborator_id = assignee_ids[0]
+            # Todoist-side casing wins for the stored/displayed name (a
+            # candidate may be a casefolded mention key or the typed
+            # spelling); the cache hit is guaranteed — the id was just
+            # resolved through it.
+            assignee_name = await todoist.collaborator_name(project.id, collaborator_id)
+            if assignee_name is None:
+                assignee_name = candidates[0]
+            try:
+                await todoist.update_task_assignee(task_id, collaborator_id)
+            except TodoistError as exc:
+                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
+                return
+            touched = sync_item(
+                _mutation_states(context, states), task_id, assignee=assignee_name
+            )
+            logger.debug(
+                "cmd_assign task=%s collaborator=%s: assigned, synced %d copy(ies)",
+                task_id,
+                collaborator_id,
+                len(touched),
+            )
+            await _edit_states(update, context, touched, mentions)
+            # _assignee_suffix is a line suffix (" — @handle"); the
+            # confirmation already draws its own arrow separator.
+            mention = _assignee_suffix(assignee_name, mentions).removeprefix(" — ")
+            await _reply_html(update, f"👤 {_render_text(item.text)} → {mention}")
+
     async def cmd_mine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """The sender's own tasks: due, then upcoming, then undated."""
         chat = update.effective_chat
@@ -1207,6 +1314,9 @@ def build_application(
     )
     application.add_handler(
         CommandHandler("edit", guarded(cmd_edit, typing=True), filters=auth)
+    )
+    application.add_handler(
+        CommandHandler("assign", guarded(cmd_assign, typing=True), filters=auth)
     )
     application.add_handler(
         CommandHandler("project", guarded(cmd_project), filters=auth)
