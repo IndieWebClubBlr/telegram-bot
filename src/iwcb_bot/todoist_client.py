@@ -33,7 +33,9 @@ class TodoistAPIError(TodoistError):
 @dataclass(frozen=True)
 class DueTask:
     task: Task
-    due: date
+    # None when the task has neither a due date nor a deadline (/mine's
+    # "No date" section); tasks_due_by only yields dated tasks.
+    due: date | None
 
 
 def _day(value: date | datetime, tz: tzinfo) -> date:
@@ -83,6 +85,8 @@ class TodoistClient:
         # fetch the same list concurrently.
         self._collaborators: dict[str, str] | None = None
         self._collaborator_misses: set[str] = set()
+        # Same one-shot-refresh bookkeeping for the reverse (name) lookup.
+        self._collaborator_name_misses: set[str] = set()
         self._collaborator_lock = asyncio.Lock()
 
     async def close(self) -> None:
@@ -128,17 +132,62 @@ class TodoistClient:
             name = self._collaborators.get(assignee_id)
             if name is not None or assignee_id in self._collaborator_misses:
                 return name
-            await self._refresh_collaborators(project_id)
+            refreshed = await self._refresh_collaborators(project_id)
             name = self._collaborators.get(assignee_id)
             # Only a *successful* refresh that lacks the id retires it;
-            # on failure _collaborators was left as-is and the next call
-            # retries instead of poisoning the lookup for the process
-            # lifetime.
-            if self._collaborators is not None:
+            # a failed refresh leaves the old cache in place, so the
+            # "is not None" test would wrongly record the miss — check
+            # the refresh result instead and retry on the next call.
+            if refreshed:
                 self._collaborator_misses.add(assignee_id)
             return name
 
-    async def _refresh_collaborators(self, project_id: str) -> None:
+    async def collaborator_id_for_name(self, project_id: str, name: str) -> str | None:
+        """Collaborator id whose name casefold-matches `name`, or None.
+
+        Shares the cached collaborator map with collaborator_name: a
+        name not in the cache triggers one refresh (a collaborator
+        added after the cache was built), after which a name still
+        missing is treated as unresolvable — recorded only after a
+        successful refresh, so an API failure retries on the next call.
+        None also covers a failed initial fetch; the caller surfaces a
+        "check ASSIGNEE_MENTIONS and retry" message either way.
+        """
+        async with self._collaborator_lock:
+            if self._collaborators is None:
+                await self._refresh_collaborators(project_id)
+            if self._collaborators is None:
+                return None
+            folded = name.casefold()
+            collaborator_id = self._id_by_folded_name(folded)
+            if collaborator_id is not None or folded in self._collaborator_name_misses:
+                return collaborator_id
+            refreshed = await self._refresh_collaborators(project_id)
+            collaborator_id = (
+                self._id_by_folded_name(folded)
+                if self._collaborators is not None
+                else None
+            )
+            # A failed refresh keeps the old cache, so the name may in
+            # fact exist — only retire it after a refresh that really
+            # succeeded and still lacks the name.
+            if refreshed:
+                self._collaborator_name_misses.add(folded)
+            return collaborator_id
+
+    def _id_by_folded_name(self, folded: str) -> str | None:
+        assert self._collaborators is not None
+        for collaborator_id, collaborator_name in self._collaborators.items():
+            if collaborator_name.casefold() == folded:
+                return collaborator_id
+        return None
+
+    async def _refresh_collaborators(self, project_id: str) -> bool:
+        """Re-fetch the collaborator cache; True when it succeeded.
+
+        On failure the previous cache (or None) is kept and the miss
+        bookkeeping must not record anything — the next call retries.
+        """
         try:
             collaborators = await self._pages(self._api.get_collaborators(project_id))
         except Exception:
@@ -147,8 +196,9 @@ class TodoistClient:
             # response shape, …) — a cosmetic feature must never break
             # list rendering or the morning cycle.
             logger.exception("could not load project collaborators")
-            return
+            return False
         self._collaborators = {c.id: c.name for c in collaborators}
+        return True
 
     async def resolve_project(self, project_id: str) -> Project:
         try:
@@ -172,6 +222,36 @@ class TodoistClient:
             due_tasks.append(DueTask(task=task, due=day))
         due_tasks.sort(key=lambda item: (item.due, item.task.content.casefold()))
         return due_tasks
+
+    async def tasks_for_assignee(
+        self, project_id: str, assignee_id: str, today: date
+    ) -> tuple[list[DueTask], list[DueTask], list[DueTask]]:
+        """All of an assignee's tasks: (due by today, future, undated).
+
+        Due and upcoming are sorted by day then content; undated by
+        content.  day is the same earlier-of-due-and-deadline value
+        /today uses.
+        """
+        tasks = await self._pages(self._api.get_tasks(project_id=project_id, limit=200))
+        due: list[DueTask] = []
+        upcoming: list[DueTask] = []
+        undated: list[DueTask] = []
+        for task in tasks:
+            if task.assignee_id != assignee_id:
+                continue
+            day = effective_day(task.due, task.deadline, self._timezone)
+            item = DueTask(task=task, due=day)
+            if day is None:
+                undated.append(item)
+            elif day <= today:
+                due.append(item)
+            else:
+                upcoming.append(item)
+        by_day = lambda item: (item.due or date.max, item.task.content.casefold())
+        due.sort(key=by_day)
+        upcoming.sort(key=by_day)
+        undated.sort(key=lambda item: item.task.content.casefold())
+        return due, upcoming, undated
 
     async def add_task_in_project(self, text: str, project: Project) -> Task:
         # Quick-add only resolves /Section and +Assignee when the text

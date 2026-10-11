@@ -16,9 +16,10 @@ All commands operate on the configured project only.
 | `/today` | Tasks in the project due today or overdue (⚠), sorted by due date; deadlines count as due dates (the earlier of the two wins when a task has both). Each line starts with a short unique ID shown as `[id]` in lowercase; overdue lines also end with `— due <date>`, with the year appended when it differs from the current one |
 | `/tomorrow` | Everything `/today` shows plus tasks due tomorrow; header `Due by <tomorrow>:`, every line carries its due date |
 | `/week` | Cumulative through end of today + 6 days (7 calendar days including today); header `Due by <date>:`, every line carries its due date |
-| `/done <id>` | Complete the task whose ID ends with `<id>` from the last shown list (`/today`, `/tomorrow` or `/week`; matching is case-insensitive). Strikes the line in place (lists that fit a single message) and confirms; for a recurring task the struck line shows the rolled next-occurrence date and the confirmation includes it too. A task already struck in the list is refused (completing it again would close the next occurrence of a recurring task). Stale data (task changed elsewhere) gives a safe error |
-| `/undo <id>` | Reopen a task completed with `/done` from the last shown list, un-striking it. Refuses recurring tasks — completing one rolls it to its next occurrence |
-| `/edit <id> <new text>` | Edit the task whose ID ends with `<id>` from the last shown list. Already-completed tasks are refused. The text is stored verbatim — quick-add parsing (dates, `p1`, `@labels`) happens only on creation (`/add`), so those tokens become part of the task name. Recurring: the new name applies to all occurrences. Max 500 characters |
+| `/mine` | Your own tasks (up to 10): due/overdue first, then all future-dated sorted by date, then tasks with no date, under section headers `📅 Due`, `📆 Upcoming` and `🗓 No date`. Requires the sender to be mapped in `ASSIGNEE_MENTIONS`; unmapped senders get a hint instead of a list. Each `/mine` replaces your previous `/mine` list (the old message stops updating); other users' `/mine` lists are untouched |
+| `/done <id>` | Complete the task whose ID ends with `<id>` from the last shown list (`/today`, `/tomorrow` or `/week`) or your `/mine` list (matching is case-insensitive; the same task in both lists is one match). Strikes the line in place (lists that fit a single message) in every list that shows it — including other users' `/mine` lists — and confirms; for a recurring task the struck line shows the rolled next-occurrence date and the confirmation includes it too. A task already struck in the list is refused (completing it again would close the next occurrence of a recurring task). Stale data (task changed elsewhere) gives a safe error |
+| `/undo <id>` | Reopen a task completed with `/done` from the last shown list or your `/mine` list, un-striking it in every list that shows it. Refuses recurring tasks — completing one rolls it to its next occurrence |
+| `/edit <id> <new text>` | Edit the task whose ID ends with `<id>` from the last shown list or your `/mine` list; the new text appears in every list that shows the task. Already-completed tasks are refused. The text is stored verbatim — quick-add parsing (dates, `p1`, `@labels`) happens only on creation (`/add`), so those tokens become part of the task name. Recurring: the new name applies to all occurrences. Max 500 characters |
 | `/project` | Link to the configured project in Todoist |
 
 Only chats listed in `ALLOWED_CHAT_IDS` are served; everyone else is ignored.
@@ -31,11 +32,14 @@ Task text is markdown (that's how Todoist stores it): links, **bold**,
 *italic*, ~~strike~~, `code` and bare URLs are rendered in list lines and
 in `/add`, `/done`, `/undo` and `/edit` replies.
 
-The bot keeps all state in memory: a restart loses the saved list, so `/done`,
-`/undo` and `/edit` need a fresh `/today`, `/tomorrow` or `/week` first. Each
-list command (and each `/add` list-refresh) replaces the saved list, which
-closes the `/undo` window for tasks completed before it. A list from a previous
-day is discarded — the bot asks for a fresh one instead of acting on stale IDs.
+The bot keeps all state in memory: a restart loses the saved lists, so `/done`,
+`/undo` and `/edit` need a fresh `/today`, `/tomorrow`, `/week` or `/mine`
+first. Each list command (and each `/add` list-refresh) replaces the chat-level
+saved list, which closes the `/undo` window for tasks completed before it; a
+`/mine` replaces only your own per-user list. Lists from a previous day are
+discarded — the bot asks for a fresh one instead of acting on stale IDs.
+`/done`, `/undo` and `/edit` resolve IDs against your `/mine` list and the
+chat-level list together, and apply the change everywhere the task appears.
 
 Recurring tasks: completing one never leaves Todoist's completed state — the
 same task stays active, just rolled to its next date. `/undo` therefore
@@ -43,7 +47,7 @@ refuses them instead of reporting a false success; bring the occurrence back
 by rescheduling in Todoist.
 
 While a command is talking to Todoist (`/add`, `/today`, `/tomorrow`, `/week`,
-`/done`, `/undo`, `/edit`), Telegram shows the bot typing until the reply arrives.
+`/mine`, `/done`, `/undo`, `/edit`), Telegram shows the bot typing until the reply arrives.
 
 ## Daily morning list
 
@@ -77,11 +81,16 @@ errors) — plus a few optional ones:
 
 ## Assignees
 
-Task lines in `/today`, `/tomorrow`, `/week` and the daily reminder show
-the Todoist assignee between the task text and the due date, e.g.
+Task lines in `/today`, `/tomorrow`, `/week`, `/mine` and the daily reminder
+show the Todoist assignee between the task text and the due date, e.g.
 `[ab]  buy milk — @abnv — due Tue 9 Oct`. The project's collaborator
 list is fetched once on first need and cached; an unknown assignee id
 (e.g. a collaborator added after startup) triggers one refresh.
+
+`/mine` also needs the reverse direction: the sending Telegram user is
+matched to their Todoist collaborator name through `ASSIGNEE_MENTIONS`
+(numeric user id first, then `@username`). A sender who is not mapped
+there gets a configuration hint instead of a list.
 
 ## Local development
 
