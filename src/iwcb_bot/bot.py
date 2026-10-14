@@ -613,10 +613,20 @@ async def _send_morning_list(
     )
 
 
+def _is_group_chat_type(kind: str) -> bool:
+    """True for the Telegram chat types the morning list targets.
+
+    Telegram reports "private", "group", "supergroup" or "channel"
+    (`ChatType.value`); only group chats get the daily list — private
+    chats and channels do not.
+    """
+    return kind in {"group", "supergroup"}
+
+
 async def _morning_loop(
     cfg: Config, project: Project, todoist: TodoistClient, application: Application
 ) -> None:
-    """Send the day's list to every allowed chat at the configured time.
+    """Send the day's list to every allowed group chat at the configured time.
 
     Started by post_init only when morning_announce_time is set; the
     task is cancelled by post_stop.  Each cycle sleeps until the next
@@ -627,13 +637,16 @@ async def _morning_loop(
     outside any chat lock; only the send and state write are locked.
     An unexpected error in one cycle is logged and the schedule
     continues; a fetch failure notifies each chat so silence is never
-    mistaken for "nothing due".
+    mistaken for "nothing due".  Chats whose type cannot be resolved
+    are skipped (group chats only), and resolved types are cached for
+    the process lifetime so get_chat runs once per chat.
     """
     at = cfg.morning_announce_time
     if at is None:
         return
     tz = cfg.resolved_timezone
     mentions = _mentions_lookup(cfg)
+    chat_types: dict[int, str] = {}
     logger.info("morning list scheduled daily at %s (%s)", at.strftime("%H:%M"), tz)
     while True:
         target = _next_announce(at, tz)
@@ -651,6 +664,23 @@ async def _morning_loop(
             # write are locked).  Failures degrade to blank assignees.
             await todoist.warm_collaborators(project.id)
             for chat_id in sorted(cfg.allowed_chat_ids):
+                kind = chat_types.get(chat_id)
+                if kind is None:
+                    try:
+                        resolved = await application.bot.get_chat(chat_id)
+                    except TelegramError:
+                        # Fail closed: "group chats only" also holds
+                        # when the type cannot be determined.  Not
+                        # cached — retried next cycle.
+                        logger.warning(
+                            "morning chat=%s: could not resolve chat type, " "skipping",
+                            chat_id,
+                        )
+                        continue
+                    kind = resolved.type.value
+                    chat_types[chat_id] = kind
+                if not _is_group_chat_type(kind):
+                    continue
                 async with _chat_lock(chat_id):
                     try:
                         if tasks is None:

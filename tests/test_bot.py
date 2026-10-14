@@ -11,6 +11,7 @@ from iwcb_bot.bot import (
     _BODY_LIMIT,
     _chunk,
     _fmt_due,
+    _is_group_chat_type,
     _md_html,
     _mentions_lookup,
     _NBSP,
@@ -554,3 +555,20 @@ class TestRenderListAssignee:
             [item], date(2026, 10, 9), show_dates=False, mentions={"x": "@y"}
         )
         assert rendered == "<code>[ab]</code>  buy milk"
+
+
+class TestIsGroupChatType:
+    def test_group_true(self) -> None:
+        assert _is_group_chat_type("group") is True
+
+    def test_supergroup_true(self) -> None:
+        assert _is_group_chat_type("supergroup") is True
+
+    def test_private_false(self) -> None:
+        assert _is_group_chat_type("private") is False
+
+    def test_channel_false(self) -> None:
+        assert _is_group_chat_type("channel") is False
+
+    def test_unknown_false(self) -> None:
+        assert _is_group_chat_type("") is False

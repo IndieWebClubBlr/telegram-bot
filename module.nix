@@ -83,7 +83,8 @@ in
       description = ''
         Wall-clock time (HH:MM, in the time zone above) at which the
         bot proactively sends the day's task list to every allowed
-        chat (MORNING_ANNOUNCE_TIME). The sent list is actionable —
+        group chat — private chats are skipped
+        (MORNING_ANNOUNCE_TIME). The sent list is actionable —
         /done, /undo and /edit work on it immediately. Set to "off"
         to disable the daily announcement. If the bot is down at the
         scheduled time, the list is not re-sent until the next day.
