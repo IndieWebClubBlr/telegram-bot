@@ -22,7 +22,7 @@ from iwcb_bot.bot import (
     _render_text,
 )
 from iwcb_bot.config import Config
-from iwcb_bot.state import ListItem
+from iwcb_bot.state import Task
 from iwcb_bot.todoist_client import _project_token, effective_day
 
 TODAY = date(2026, 10, 9)
@@ -190,7 +190,7 @@ class TestRenderText:
 class TestRenderList:
     def test_link_and_code_id(self) -> None:
         items = [
-            ListItem(
+            Task(
                 task_id="6cabc",
                 text="Post on [events.indieweb.org](https://events.indieweb.org)",
                 due=TODAY,
@@ -204,15 +204,15 @@ class TestRenderList:
         )
 
     def test_multiline_text_stays_on_one_line(self) -> None:
-        items = [ListItem(task_id="aa", text="a\nb", due=TODAY)]
+        items = [Task(task_id="aa", text="a\nb", due=TODAY)]
         out = _render_list(items, TODAY, show_dates=False)
         assert "\n" not in out
         assert "a b" in out
 
     def test_ids_bracketed_in_code_run(self) -> None:
         items = [
-            ListItem(task_id="zab", text="one", due=TODAY),
-            ListItem(task_id="ab", text="two", due=TODAY),
+            Task(task_id="zab", text="one", due=TODAY),
+            Task(task_id="ab", text="two", due=TODAY),
         ]
         out = _render_list(items, TODAY, show_dates=False)
         assert "<code>[zab]</code>" in out
@@ -220,38 +220,38 @@ class TestRenderList:
         assert f"<code>[ab{_NBSP}]</code>" in out
 
     def test_long_text_truncated(self) -> None:
-        items = [ListItem(task_id="aa", text="x" * 600, due=TODAY)]
+        items = [Task(task_id="aa", text="x" * 600, due=TODAY)]
         out = _render_list(items, TODAY, show_dates=False)
         assert "…" in out
         assert "x" * 501 not in out
 
     def test_overdue_active_gets_marker_and_due_suffix(self) -> None:
-        items = [ListItem(task_id="aa", text="late", due=date(2026, 6, 9))]
+        items = [Task(task_id="aa", text="late", due=date(2026, 6, 9))]
         out = _render_list(items, TODAY, show_dates=False)
         assert "⚠ " in out
         assert "— due Tue 9 Jun" in out
 
     def test_overdue_done_has_no_due_suffix(self) -> None:
-        items = [ListItem(task_id="aa", text="late", due=date(2026, 6, 9), done=True)]
+        items = [Task(task_id="aa", text="late", due=date(2026, 6, 9), done=True)]
         out = _render_list(items, TODAY, show_dates=False)
         assert "<s>late</s>" in out
         assert "— due" not in out
 
     def test_today_item_has_no_due_suffix(self) -> None:
-        items = [ListItem(task_id="aa", text="task", due=TODAY)]
+        items = [Task(task_id="aa", text="task", due=TODAY)]
         out = _render_list(items, TODAY, show_dates=False)
         assert "— due" not in out
 
     def test_done_item_wrapped_in_strike(self) -> None:
-        items = [ListItem(task_id="aa", text="task", due=TODAY, done=True)]
+        items = [Task(task_id="aa", text="task", due=TODAY, done=True)]
         out = _render_list(items, TODAY, show_dates=False)
         assert "<s>task</s>" in out
 
     def test_show_dates_dated_all_lines(self) -> None:
         items = [
-            ListItem(task_id="aa", text="today", due=TODAY),
-            ListItem(task_id="ab", text="later", due=date(2026, 10, 12)),
-            ListItem(task_id="ac", text="done", due=date(2026, 10, 11), done=True),
+            Task(task_id="aa", text="today", due=TODAY),
+            Task(task_id="ab", text="later", due=date(2026, 10, 12)),
+            Task(task_id="ac", text="done", due=date(2026, 10, 11), done=True),
         ]
         out = _render_list(items, TODAY, show_dates=True)
         lines = out.splitlines()
@@ -261,15 +261,15 @@ class TestRenderList:
         assert "<s>done</s>" in lines[2]
 
     def test_show_dates_overdue_keeps_marker(self) -> None:
-        items = [ListItem(task_id="aa", text="late", due=date(2026, 6, 9))]
+        items = [Task(task_id="aa", text="late", due=date(2026, 6, 9))]
         out = _render_list(items, TODAY, show_dates=True)
         assert "⚠ " in out
         assert "— due Tue 9 Jun" in out
 
     def test_every_rendered_line_is_balanced_html(self) -> None:
         items = [
-            ListItem(task_id="aa", text="line1\nline2 [x](https://e.x)", due=TODAY),
-            ListItem(task_id="ab", text="done", due=TODAY, done=True),
+            Task(task_id="aa", text="line1\nline2 [x](https://e.x)", due=TODAY),
+            Task(task_id="ab", text="done", due=TODAY, done=True),
         ]
         out = _render_list(items, TODAY, show_dates=False)
         for line in out.splitlines():
@@ -465,9 +465,9 @@ class TestNextAnnounce:
 class TestRenderListDividers:
     def test_headers_print_before_their_items(self) -> None:
         items = [
-            ListItem(task_id="aa", text="due task", due=TODAY),
-            ListItem(task_id="ab", text="future", due=date(2026, 10, 12)),
-            ListItem(task_id="ac", text="someday", due=None),
+            Task(task_id="aa", text="due task", due=TODAY),
+            Task(task_id="ab", text="future", due=date(2026, 10, 12)),
+            Task(task_id="ac", text="someday", due=None),
         ]
         rendered = _render_list(
             items,
@@ -481,12 +481,12 @@ class TestRenderListDividers:
         assert lines[4] == "<b>🗓 No date</b>"
 
     def test_undated_line_has_no_date_suffix(self) -> None:
-        items = [ListItem(task_id="aa", text="someday", due=None)]
+        items = [Task(task_id="aa", text="someday", due=None)]
         rendered = _render_list(items, TODAY, show_dates=True)
         assert rendered == "<code>[aa]</code>  someday"
 
     def test_undated_line_never_overdue(self) -> None:
-        items = [ListItem(task_id="aa", text="someday", due=None, done=False)]
+        items = [Task(task_id="aa", text="someday", due=None, done=False)]
         rendered = _render_list(items, TODAY, show_dates=False)
         assert "⚠" not in rendered
 
@@ -530,7 +530,7 @@ class TestAssigneeSuffix:
 
 
 class TestRenderListAssignee:
-    _ITEM = ListItem(
+    _ITEM = Task(
         task_id="62ab",
         text="buy milk",
         due=date(2026, 10, 9),
@@ -551,7 +551,7 @@ class TestRenderListAssignee:
         assert "buy milk — Abhinav Nair" in rendered
 
     def test_unassigned_has_no_suffix(self) -> None:
-        item = ListItem(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
+        item = Task(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
         rendered = _render_list(
             [item], date(2026, 10, 9), show_dates=False, mentions={"x": "@y"}
         )
@@ -576,15 +576,17 @@ class TestIsGroupChatType:
 
 
 class TestRenderListMessage:
-    ITEM = ListItem(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
+    ITEM = Task(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
+    TASKS = {ITEM.task_id: ITEM}
 
     def test_empty_returns_no_chunks(self) -> None:
-        chunks = _render_list_message([], TODAY, mentions={}, show_dates=False)
+        chunks = _render_list_message([], {}, TODAY, mentions={}, show_dates=False)
         assert chunks == []
 
     def test_headline_prefixes_single_chunk(self) -> None:
         chunks = _render_list_message(
-            [self.ITEM],
+            [self.ITEM.task_id],
+            self.TASKS,
             TODAY,
             mentions={},
             show_dates=False,
@@ -596,7 +598,8 @@ class TestRenderListMessage:
 
     def test_cutoff_header_between_headline_and_body(self) -> None:
         chunks = _render_list_message(
-            [self.ITEM],
+            [self.ITEM.task_id],
+            self.TASKS,
             TODAY,
             mentions={},
             show_dates=True,
@@ -609,5 +612,13 @@ class TestRenderListMessage:
         assert "buy milk — due Fri 9 Oct" in body
 
     def test_body_only_without_headline_or_cutoff(self) -> None:
-        chunks = _render_list_message([self.ITEM], TODAY, mentions={}, show_dates=False)
+        chunks = _render_list_message(
+            [self.ITEM.task_id], self.TASKS, TODAY, mentions={}, show_dates=False
+        )
         assert chunks == ["<code>[ab]</code>  buy milk"]
+
+    def test_missing_entity_for_id_raises(self) -> None:
+        # Storage invariant: every stored list id has a map entity, so
+        # a miss is a bug — never a silently skipped line.
+        with pytest.raises(AssertionError, match="no entity in the map"):
+            _render_list_message(["zz"], {}, TODAY, mentions={}, show_dates=False)

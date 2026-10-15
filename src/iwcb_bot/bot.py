@@ -26,21 +26,21 @@ from todoist_api_python.models import Project
 from .config import Config
 from .state import (
     UNSET,
-    ListItem,
-    ListState,
-    active_states,
-    any_done,
+    Task,
+    TaskList,
+    active_lists,
     assignee_name_candidates,
-    find_item,
-    get_chat_state,
-    mutation_states,
+    get_chat_list,
+    get_tasks,
+    is_done,
+    put_tasks,
     resolve_one,
-    set_chat_state,
-    set_mine_state,
-    sync_item,
+    set_chat_list,
+    set_mine_list,
     take_mine,
     task_suffixes,
     todoist_name_for_user,
+    update_task,
 )
 from .todoist_client import DueTask, TodoistClient, TodoistError, effective_day
 
@@ -229,7 +229,7 @@ async def _reply_html(update: Update, text: str) -> None:
 
 
 async def _require_unique_id(
-    update: Update, states: list[ListState], folded: str, log_name: str
+    update: Update, states: list[TaskList], folded: str, log_name: str
 ) -> str | None:
     """The resolve branch /done, /undo, /edit, /assign and /due share.
 
@@ -355,7 +355,7 @@ def _assignee_suffix(name: str | None, mentions: dict[str, str]) -> str:
 
 
 def _render_list(
-    items: list[ListItem],
+    items: list[Task],
     today: date,
     *,
     show_dates: bool,
@@ -364,13 +364,15 @@ def _render_list(
 ) -> str:
     """Render the task list body (no headline).
 
-    With show_dates (used by /tomorrow, /week and /mine) every line
-    carries its due date so multi-day lists are readable; /today only
-    dates overdue lines.  Done items keep their date in multi-day lists
-    too — the strike-through already marks them.  Assignees (resolved
-    at fetch time) render between the task text and the due suffix.
-    dividers maps an item index to a bold section header printed above
-    that line (/mine's Due/Upcoming/No date sections).
+    Pure over resolved entities: callers resolve list ids through the
+    chat's task map first (_resolve_entities), so this never sees the
+    storage.  With show_dates (used by /tomorrow, /week and /mine) every
+    line carries its due date so multi-day lists are readable; /today
+    only dates overdue lines.  Done items keep their date in multi-day
+    lists too — the strike-through already marks them.  Assignees
+    (resolved at fetch time) render between the task text and the due
+    suffix.  dividers maps an item index to a bold section header
+    printed above that line (/mine's Due/Upcoming/No date sections).
     """
     if mentions is None:
         mentions = {}
@@ -396,36 +398,46 @@ def _render_list(
     return "\n".join(lines)
 
 
-async def _build_items(
-    tasks: list[DueTask], todoist: TodoistClient, project_id: str
-) -> list[ListItem]:
-    """State items for fetched tasks, resolving assignee display names.
+def _resolve_entities(task_ids: list[str], tasks: dict[str, Task]) -> list[Task]:
+    """Entities for the list's id order (invariant: every id has one)."""
+    resolved: list[Task] = []
+    for task_id in task_ids:
+        entity = tasks.get(task_id)
+        assert entity is not None, f"list id {task_id} has no entity in the map"
+        resolved.append(entity)
+    return resolved
 
-    Assignee resolution goes through the client's cached collaborator
-    map (fetched once, refreshed on unknown ids) and never raises — a
-    failed lookup leaves the assignee blank.
+
+async def _build_entities(
+    tasks: list[DueTask], todoist: TodoistClient, project_id: str
+) -> dict[str, Task]:
+    """Map of fetched task id → entity, resolving assignee display names.
+
+    Insertion order = fetch order, so list(dict) gives the id order to
+    store.  Assignee resolution goes through the client's cached
+    collaborator map (fetched once, refreshed on unknown ids) and never
+    raises — a failed lookup leaves the assignee blank.
     """
-    items: list[ListItem] = []
+    entities: dict[str, Task] = {}
     for task in tasks:
         assignee: str | None = None
         if task.task.assignee_id:
             assignee = await todoist.collaborator_name(
                 project_id, task.task.assignee_id
             )
-        items.append(
-            ListItem(
-                task_id=task.task.id,
-                text=task.task.content,
-                due=task.due,
-                recurring=bool(task.task.due and task.task.due.is_recurring),
-                assignee=assignee,
-            )
+        entities[task.task.id] = Task(
+            task_id=task.task.id,
+            text=task.task.content,
+            due=task.due,
+            recurring=bool(task.task.due and task.task.due.is_recurring),
+            assignee=assignee,
         )
-    return items
+    return entities
 
 
 def _render_list_message(
-    items: list[ListItem],
+    task_ids: list[str],
+    tasks: dict[str, Task],
     today: date,
     mentions: dict[str, str],
     *,
@@ -434,16 +446,20 @@ def _render_list_message(
     headline: str | None = None,
     dividers: dict[int, str] | None = None,
 ) -> list[str]:
-    """Render state items into sendable chunks.
+    """Resolve the list's ids and render into sendable chunks.
 
     cutoff (when given) prefixes the "Due by <date>:" header; /mine
     passes None and uses dividers for its sections instead.  Returns []
     for an empty list — the caller decides the empty reply.
     """
-    if not items:
+    if not task_ids:
         return []
     body = _render_list(
-        items, today, show_dates=show_dates, mentions=mentions, dividers=dividers
+        _resolve_entities(task_ids, tasks),
+        today,
+        show_dates=show_dates,
+        mentions=mentions,
+        dividers=dividers,
     )
     if cutoff is not None:
         body = f"<b>Due by {_fmt_due(cutoff, today)}:</b>\n{body}"
@@ -480,18 +496,26 @@ async def _send_list(
 ) -> None:
     """Send the rendered list, optionally under an HTML headline line.
 
-    Stores the list state so /done, /undo and /edit act on it.
+    Stores the list so /done, /undo and /edit act on it: entities go
+    into the chat's task map first, then the id order points at them.
     """
     message = update.effective_message
     if message is None:
         return
     show_dates = cutoff > today
-    items = await _build_items(tasks, todoist, project_id)
+    entities = await _build_entities(tasks, todoist, project_id)
+    put_tasks(context.chat_data, entities.values())
     chunks = _render_list_message(
-        items, today, mentions, show_dates=show_dates, cutoff=cutoff, headline=headline
+        list(entities),
+        entities,
+        today,
+        mentions,
+        show_dates=show_dates,
+        cutoff=cutoff,
+        headline=headline,
     )
     if not chunks:
-        set_chat_state(context.chat_data, None)
+        set_chat_list(context.chat_data, None)
         if headline is not None:
             await _reply_html(update, headline)
         elif cutoff > today:
@@ -502,13 +526,13 @@ async def _send_list(
     message_id = await _send_chunks(
         lambda text: message.reply_text(text, parse_mode=ParseMode.HTML), chunks
     )
-    set_chat_state(
+    set_chat_list(
         context.chat_data,
-        ListState(
+        TaskList(
             message_id=message_id,
             day=today,
             cutoff=cutoff,
-            items=items,
+            task_ids=list(entities),
             headline=headline,
             show_dates=show_dates,
         ),
@@ -518,39 +542,41 @@ async def _send_list(
 async def _edit_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    state: ListState,
+    task_list: TaskList,
     mentions: dict[str, str],
+    tasks: dict[str, Task],
 ) -> None:
     """Re-render the stored list message from its state.
 
-    Renders with state.day — not the current clock — so a strike applied
-    just after midnight still draws against the day the list was built
-    for, and the message the user is looking at stays consistent.
+    Renders with task_list.day — not the current clock — so a strike
+    applied just after midnight still draws against the day the list
+    was built for, and the message the user is looking at stays
+    consistent.  `tasks` is the chat's map; ids resolve through it.
     """
-    if state.message_id is None:
+    if task_list.message_id is None:
         return
     chat = update.effective_chat
     if chat is None:
         return
-    today = state.day
+    today = task_list.day
     rendered = _render_list(
-        state.items,
+        _resolve_entities(task_list.task_ids, tasks),
         today,
-        show_dates=state.show_dates or state.cutoff > today,
+        show_dates=task_list.show_dates or task_list.cutoff > today,
         mentions=mentions,
-        dividers=state.dividers,
+        dividers=task_list.dividers,
     )
-    if state.cutoff > today:
-        rendered = f"<b>Due by {_fmt_due(state.cutoff, today)}:</b>\n{rendered}"
-    if state.headline is not None:
-        rendered = f"{state.headline}\n\n{rendered}"
+    if task_list.cutoff > today:
+        rendered = f"<b>Due by {_fmt_due(task_list.cutoff, today)}:</b>\n{rendered}"
+    if task_list.headline is not None:
+        rendered = f"{task_list.headline}\n\n{rendered}"
     if len(rendered) > _TELEGRAM_LIMIT:
         logger.warning("rendered list is %d chars, skipping edit", len(rendered))
         return
     try:
         await context.bot.edit_message_text(
             chat_id=chat.id,
-            message_id=state.message_id,
+            message_id=task_list.message_id,
             text=rendered,
             parse_mode=ParseMode.HTML,
         )
@@ -562,22 +588,23 @@ async def _edit_list(
             # User deleted the list message; stop editing it and stop
             # spamming exception logs on every strike.
             logger.debug("list message deleted; clearing edit target")
-            state.message_id = None
+            task_list.message_id = None
         else:
             logger.exception("could not edit list message")
     except TelegramError:
         logger.exception("could not edit list message")
 
 
-async def _edit_states(
+async def _edit_lists(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    states: list[ListState],
+    task_lists: list[TaskList],
     mentions: dict[str, str],
+    tasks: dict[str, Task],
 ) -> None:
-    """Re-edit every message backing `states` (chat list + /mine lists)."""
-    for state in states:
-        await _edit_list(update, context, state, mentions)
+    """Re-edit every message backing `task_lists` (chat list + /mine lists)."""
+    for task_list in task_lists:
+        await _edit_list(update, context, task_list, mentions, tasks)
 
 
 async def _send_morning_list(
@@ -592,7 +619,7 @@ async def _send_morning_list(
     *,
     send_when_empty: bool,
 ) -> None:
-    """Send the morning list to one chat and store it as that chat's state.
+    """Send the morning list to one chat and store it as that chat's list.
 
     Same rendering as /today under a "Daily Task Reminder" title; the
     message becomes the last shown list, so /done, /undo and /edit work
@@ -604,9 +631,11 @@ async def _send_morning_list(
     yesterday's message stops updating.  Caller holds the chat lock.
     """
     chat_data = application.chat_data[chat_id]
-    items = await _build_items(tasks, todoist, project_id)
+    entities = await _build_entities(tasks, todoist, project_id)
+    put_tasks(chat_data, entities.values())
     chunks = _render_list_message(
-        items,
+        list(entities),
+        entities,
         today,
         mentions,
         show_dates=cutoff > today,
@@ -614,7 +643,7 @@ async def _send_morning_list(
         headline=_MORNING_TITLE,
     )
     if not chunks:
-        set_chat_state(chat_data, None)
+        set_chat_list(chat_data, None)
         if send_when_empty:
             await application.bot.send_message(
                 chat_id=chat_id,
@@ -628,13 +657,13 @@ async def _send_morning_list(
         ),
         chunks,
     )
-    set_chat_state(
+    set_chat_list(
         chat_data,
-        ListState(
+        TaskList(
             message_id=message_id,
             day=today,
             cutoff=cutoff,
-            items=items,
+            task_ids=list(entities),
             headline=_MORNING_TITLE,
             show_dates=cutoff > today,
         ),
@@ -781,10 +810,10 @@ def build_application(
             day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
             detail = f" (due {_fmt_due(day, today)})" if day is not None else ""
             headline = f"✅ Added: {_render_text(task.content)}{detail}"
-            state = get_chat_state(context.chat_data)
-            if state is not None and state.day != today:
-                state = None
-            cutoff = state.cutoff if state is not None else today
+            task_list = get_chat_list(context.chat_data)
+            if task_list is not None and task_list.day != today:
+                task_list = None
+            cutoff = task_list.cutoff if task_list is not None else today
             if day is None or day > cutoff:
                 await _reply_html(update, headline)
                 return
@@ -833,22 +862,22 @@ def build_application(
         cmd.__name__ = name
         return guarded(cmd, typing=True)
 
-    async def _require_states(
+    async def _require_lists(
         update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
-    ) -> list[ListState] | None:
+    ) -> list[TaskList] | None:
         """Today's lists for this user (their /mine + the chat list).
 
         Callers hold the chat lock.  Returns None after replying why
         there is nothing to act on.
         """
         today = cfg.today()
-        states = active_states(context.chat_data, user_id, today)
-        if states:
-            return states
-        if get_chat_state(context.chat_data) is not None:
-            # active_states pruned stale /mine lists; a stale chat list
+        lists = active_lists(context.chat_data, user_id, today)
+        if lists:
+            return lists
+        if get_chat_list(context.chat_data) is not None:
+            # active_lists pruned stale /mine lists; a stale chat list
             # is cleared here so the message explains the expiry once.
-            set_chat_state(context.chat_data, None)
+            set_chat_list(context.chat_data, None)
             await _reply(
                 update,
                 f"The last list is from a previous day — send {_LIST_CMDS} " "or /mine",
@@ -869,27 +898,20 @@ def build_application(
             )
             return
         async with _chat_lock(chat.id):
-            states = await _require_states(update, context, user.id)
-            if states is None:
+            lists = await _require_lists(update, context, user.id)
+            if lists is None:
                 return
             folded = query.casefold()
-            task_id = await _require_unique_id(update, states, folded, "cmd_done")
+            task_id = await _require_unique_id(update, lists, folded, "cmd_done")
             if task_id is None:
                 return
-            item = find_item(states, task_id)
-            assert item is not None  # resolved from the same union
-            # The guard must see every stored copy, not just the
-            # sender's lists: another user's refreshed /mine can show a
-            # fresh un-struck line while their older struck copy (or the
-            # chat list) still has it — completing again would close a
-            # recurring task's *next* occurrence.  Same scope as the
-            # sync below.
-            mutation = mutation_states(context.chat_data, cfg.today(), states)
-            if any_done(mutation, task_id):
-                # A struck copy in *any* stored list blocks this — most
-                # often the chat list, which a /mine refresh does not
-                # replace, so point at the chat list refresh.
-                logger.debug("cmd_done task=%s: already done in a stored list", task_id)
+            tasks = get_tasks(context.chat_data)
+            item = tasks.get(task_id)
+            assert item is not None  # resolved from this chat's lists
+            # One record per task: the guard reads the map directly
+            # instead of voting across per-list copies.
+            if is_done(tasks, task_id):
+                logger.debug("cmd_done task=%s: already done", task_id)
                 await _reply(
                     update, f"Already completed — send {_LIST_CMDS} to refresh"
                 )
@@ -908,23 +930,26 @@ def build_application(
                         next_due = day.date() if isinstance(day, datetime) else day
                 except TodoistError:
                     logger.warning("could not read next occurrence of %s", task_id)
-            # Strike the copy in every stored list (chat + any /mine),
-            # showing the rolled occurrence's date for recurring tasks.
-            # due follows sentinel semantics: UNSET leaves the date
-            # alone — a bare done=True must not clear the line — while
-            # a rolled recurring date replaces it.
-            touched = sync_item(
-                mutation,
+            # Update the record once (done + the rolled occurrence's
+            # date for recurring tasks), then re-edit every list
+            # displaying it.  due follows sentinel semantics: UNSET
+            # leaves the date alone — a bare done=True must not clear
+            # the line — while a rolled recurring date replaces it.
+            touched = update_task(
+                context.chat_data,
+                cfg.today(),
                 task_id,
                 done=True,
                 due=next_due if next_due is not None else UNSET,
             )
             logger.debug(
-                "cmd_done task=%s: completed, synced %d list copy(ies)",
+                "cmd_done task=%s: completed, updated %d displaying list(s)",
                 task_id,
                 len(touched),
             )
-            await _edit_states(update, context, touched, mentions)
+            await _edit_lists(
+                update, context, touched, mentions, get_tasks(context.chat_data)
+            )
             if item.recurring and next_due is not None:
                 await _reply_html(
                     update,
@@ -946,19 +971,17 @@ def build_application(
             )
             return
         async with _chat_lock(chat.id):
-            states = await _require_states(update, context, user.id)
-            if states is None:
+            lists = await _require_lists(update, context, user.id)
+            if lists is None:
                 return
             folded = query.casefold()
-            task_id = await _require_unique_id(update, states, folded, "cmd_undo")
+            task_id = await _require_unique_id(update, lists, folded, "cmd_undo")
             if task_id is None:
                 return
-            item = find_item(states, task_id)
-            assert item is not None  # resolved from the same union
-            if not any_done(states, task_id):
-                # No copy struck — including the case where one list was
-                # refreshed and lost the strike while another still has it
-                # (any_done above covers the reverse divergence).
+            tasks = get_tasks(context.chat_data)
+            item = tasks.get(task_id)
+            assert item is not None  # resolved from this chat's lists
+            if not is_done(tasks, task_id):
                 await _reply(update, "Not completed — nothing to undo")
                 return
             if item.recurring:
@@ -973,17 +996,15 @@ def build_application(
             except TodoistError as exc:
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
-            touched = sync_item(
-                mutation_states(context.chat_data, cfg.today(), states),
-                task_id,
-                done=False,
-            )
+            touched = update_task(context.chat_data, cfg.today(), task_id, done=False)
             logger.debug(
-                "cmd_undo task=%s: reopened, synced %d list copy(ies)",
+                "cmd_undo task=%s: reopened, updated %d displaying list(s)",
                 task_id,
                 len(touched),
             )
-            await _edit_states(update, context, touched, mentions)
+            await _edit_lists(
+                update, context, touched, mentions, get_tasks(context.chat_data)
+            )
             await _reply_html(update, f"↩️ {_render_text(item.text)}")
 
     async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1004,16 +1025,17 @@ def build_application(
             await _reply(update, "Task text too long — max 500 characters")
             return
         async with _chat_lock(chat.id):
-            states = await _require_states(update, context, user.id)
-            if states is None:
+            lists = await _require_lists(update, context, user.id)
+            if lists is None:
                 return
             folded = query.casefold()
-            task_id = await _require_unique_id(update, states, folded, "cmd_edit")
+            task_id = await _require_unique_id(update, lists, folded, "cmd_edit")
             if task_id is None:
                 return
-            item = find_item(states, task_id)
-            assert item is not None  # resolved from the same union
-            if any_done(states, task_id):
+            tasks = get_tasks(context.chat_data)
+            item = tasks.get(task_id)
+            assert item is not None  # resolved from this chat's lists
+            if is_done(tasks, task_id):
                 logger.debug("cmd_edit task=%s: already done, refusing", task_id)
                 await _reply(update, "Already completed — can't edit")
                 return
@@ -1022,17 +1044,17 @@ def build_application(
             except TodoistError as exc:
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
-            touched = sync_item(
-                mutation_states(context.chat_data, cfg.today(), states),
-                task_id,
-                text=new_text,
+            touched = update_task(
+                context.chat_data, cfg.today(), task_id, text=new_text
             )
             logger.debug(
-                "cmd_edit task=%s: renamed, synced %d list copy(ies)",
+                "cmd_edit task=%s: renamed, updated %d displaying list(s)",
                 task_id,
                 len(touched),
             )
-            await _edit_states(update, context, touched, mentions)
+            await _edit_lists(
+                update, context, touched, mentions, get_tasks(context.chat_data)
+            )
             await _reply_html(update, f"✏️ {_render_text(new_text)}")
 
     async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1050,16 +1072,17 @@ def build_application(
             )
             return
         async with _chat_lock(chat.id):
-            states = await _require_states(update, context, user.id)
-            if states is None:
+            lists = await _require_lists(update, context, user.id)
+            if lists is None:
                 return
             folded = query.casefold()
-            task_id = await _require_unique_id(update, states, folded, "cmd_assign")
+            task_id = await _require_unique_id(update, lists, folded, "cmd_assign")
             if task_id is None:
                 return
-            item = find_item(states, task_id)
-            assert item is not None  # resolved from the same union
-            if any_done(states, task_id):
+            tasks = get_tasks(context.chat_data)
+            item = tasks.get(task_id)
+            assert item is not None  # resolved from this chat's lists
+            if is_done(tasks, task_id):
                 logger.debug("cmd_assign task=%s: already done, refusing", task_id)
                 await _reply(update, "Already completed — can't assign")
                 return
@@ -1114,18 +1137,21 @@ def build_application(
             except TodoistError as exc:
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
-            touched = sync_item(
-                mutation_states(context.chat_data, cfg.today(), states),
+            touched = update_task(
+                context.chat_data,
+                cfg.today(),
                 task_id,
                 assignee=assignee_name,
             )
             logger.debug(
-                "cmd_assign task=%s collaborator=%s: assigned, synced %d copy(ies)",
+                "cmd_assign task=%s collaborator=%s: assigned, updated %d list(s)",
                 task_id,
                 collaborator_id,
                 len(touched),
             )
-            await _edit_states(update, context, touched, mentions)
+            await _edit_lists(
+                update, context, touched, mentions, get_tasks(context.chat_data)
+            )
             # _assignee_suffix is a line suffix (" — @handle"); the
             # confirmation already draws its own arrow separator.
             mention = _assignee_suffix(assignee_name, mentions).removeprefix(" — ")
@@ -1146,16 +1172,17 @@ def build_application(
             )
             return
         async with _chat_lock(chat.id):
-            states = await _require_states(update, context, user.id)
-            if states is None:
+            lists = await _require_lists(update, context, user.id)
+            if lists is None:
                 return
             folded = query.casefold()
-            task_id = await _require_unique_id(update, states, folded, "cmd_due")
+            task_id = await _require_unique_id(update, lists, folded, "cmd_due")
             if task_id is None:
                 return
-            item = find_item(states, task_id)
-            assert item is not None  # resolved from the same union
-            if any_done(states, task_id):
+            tasks = get_tasks(context.chat_data)
+            item = tasks.get(task_id)
+            assert item is not None  # resolved from this chat's lists
+            if is_done(tasks, task_id):
                 logger.debug("cmd_due task=%s: already done, refusing", task_id)
                 await _reply(update, "Already completed — can't reschedule")
                 return
@@ -1178,13 +1205,16 @@ def build_application(
             logger.debug(
                 "cmd_due task=%s: day=%s recurring=%s", task_id, day, is_recurring
             )
-            touched = sync_item(
-                mutation_states(context.chat_data, cfg.today(), states),
+            touched = update_task(
+                context.chat_data,
+                cfg.today(),
                 task_id,
                 due=day,
                 recurring=is_recurring,
             )
-            await _edit_states(update, context, touched, mentions)
+            await _edit_lists(
+                update, context, touched, mentions, get_tasks(context.chat_data)
+            )
             if day is None:
                 await _reply_html(update, f"📅 {_render_text(item.text)} → no date")
             else:
@@ -1241,12 +1271,13 @@ def build_application(
                 len(selected),
             )
             if not selected:
-                set_mine_state(context.chat_data, user.id, None)
+                set_mine_list(context.chat_data, user.id, None)
                 await _reply(update, "Nothing assigned to you 🎉")
                 return
-            items = await _build_items(selected, todoist, project.id)
+            entities = await _build_entities(selected, todoist, project.id)
             chunks = _render_list_message(
-                items,
+                list(entities),
+                entities,
                 today,
                 mentions,
                 show_dates=True,
@@ -1257,14 +1288,15 @@ def build_application(
                 lambda text: message.reply_text(text, parse_mode=ParseMode.HTML),
                 chunks,
             )
-            set_mine_state(
+            put_tasks(context.chat_data, entities.values())
+            set_mine_list(
                 context.chat_data,
                 user.id,
-                ListState(
+                TaskList(
                     message_id=message_id,
                     day=today,
                     cutoff=today,
-                    items=items,
+                    task_ids=list(entities),
                     headline=_MINE_TITLE,
                     show_dates=True,
                     dividers=dividers,
