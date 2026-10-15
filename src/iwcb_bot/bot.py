@@ -29,12 +29,12 @@ from .state import (
     ListItem,
     ListState,
     active_states,
-    all_mine_states,
     any_done,
     assignee_name_candidates,
-    displayed_matches,
+    find_item,
     get_chat_state,
-    resolve_ids,
+    mutation_states,
+    resolve_one,
     set_chat_state,
     set_mine_state,
     sync_item,
@@ -226,6 +226,28 @@ async def _reply_html(update: Update, text: str) -> None:
     message = update.effective_message
     if message is not None:
         await message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def _require_unique_id(
+    update: Update, states: list[ListState], folded: str, log_name: str
+) -> str | None:
+    """The resolve branch /done, /undo, /edit, /assign and /due share.
+
+    Replies with the shared no-match/ambiguous message and returns
+    None; returns the single match's task id otherwise.  The decision
+    itself is state.resolve_one (pure, tested) — this adds only the
+    log line and the reply.
+    """
+    outcome, ids = resolve_one(states, folded)
+    if outcome == "none":
+        logger.debug("%s: no match (%d state(s))", log_name, len(states))
+        await _reply(update, "No match in the last shown list")
+        return None
+    if outcome == "ambiguous":
+        logger.debug("%s: ambiguous, %d matches", log_name, len(ids))
+        await _reply(update, f"Ambiguous — matches {len(ids)} tasks, be more specific")
+        return None
+    return ids[0]
 
 
 def _md_html(text: str) -> str:
@@ -835,56 +857,6 @@ def build_application(
             await _reply(update, f"Send {_LIST_CMDS} or /mine first")
         return None
 
-    def _union_ids(states: list[ListState]) -> list[str]:
-        """Task ids across all states, deduplicated (first wins)."""
-        return list(
-            dict.fromkeys(item.task_id for state in states for item in state.items)
-        )
-
-    def _resolve_query(states: list[ListState], folded: str) -> list[str]:
-        """Resolve a typed id against the sender's lists.
-
-        Prefers an exact match of a *displayed* short suffix (the label
-        the user copied from a message); a shown label can otherwise
-        collide with a never-displayed tail in the other list and be
-        rejected as ambiguous.  Falls back to exact/tail matching over
-        the union of both lists.
-        """
-        displayed = displayed_matches(states, folded)
-        if len(displayed) == 1:
-            return displayed
-        return resolve_ids(_union_ids(states), folded)
-
-    def _mutation_states(
-        context: ContextTypes.DEFAULT_TYPE, states: list[ListState]
-    ) -> list[ListState]:
-        """Resolution states plus every user's /mine, identity-deduped.
-
-        IDs resolve against the sender's lists only (active_states), but
-        the mutation must land on every stored copy: an unstruck /mine
-        copy in another user's list would pass the already-done guard
-        and complete a recurring task a second time.
-        """
-        merged = [*states, *all_mine_states(context.chat_data, cfg.today())]
-        seen: set[int] = set()
-        unique: list[ListState] = []
-        for state in merged:
-            if id(state) not in seen:
-                seen.add(id(state))
-                unique.append(state)
-        return unique
-
-    def _find_item(states: list[ListState], task_id: str) -> ListItem | None:
-        return next(
-            (
-                item
-                for state in states
-                for item in state.items
-                if item.task_id == task_id
-            ),
-            None,
-        )
-
     async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
         user = update.effective_user
@@ -901,20 +873,10 @@ def build_application(
             if states is None:
                 return
             folded = query.casefold()
-            resolved = _resolve_query(states, folded)
-            if not resolved:
-                logger.debug("cmd_done: no match (%d state(s))", len(states))
-                await _reply(update, "No match in the last shown list")
+            task_id = await _require_unique_id(update, states, folded, "cmd_done")
+            if task_id is None:
                 return
-            if len(resolved) > 1:
-                logger.debug("cmd_done: ambiguous, %d matches", len(resolved))
-                await _reply(
-                    update,
-                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-                )
-                return
-            task_id = resolved[0]
-            item = _find_item(states, task_id)
+            item = find_item(states, task_id)
             assert item is not None  # resolved from the same union
             # The guard must see every stored copy, not just the
             # sender's lists: another user's refreshed /mine can show a
@@ -922,7 +884,7 @@ def build_application(
             # chat list) still has it — completing again would close a
             # recurring task's *next* occurrence.  Same scope as the
             # sync below.
-            mutation = _mutation_states(context, states)
+            mutation = mutation_states(context.chat_data, cfg.today(), states)
             if any_done(mutation, task_id):
                 # A struck copy in *any* stored list blocks this — most
                 # often the chat list, which a /mine refresh does not
@@ -988,20 +950,10 @@ def build_application(
             if states is None:
                 return
             folded = query.casefold()
-            resolved = _resolve_query(states, folded)
-            if len(resolved) > 1:
-                logger.debug("cmd_undo: ambiguous, %d matches", len(resolved))
-                await _reply(
-                    update,
-                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-                )
+            task_id = await _require_unique_id(update, states, folded, "cmd_undo")
+            if task_id is None:
                 return
-            if not resolved:
-                logger.debug("cmd_undo: no match (%d state(s))", len(states))
-                await _reply(update, "No match in the last shown list")
-                return
-            task_id = resolved[0]
-            item = _find_item(states, task_id)
+            item = find_item(states, task_id)
             assert item is not None  # resolved from the same union
             if not any_done(states, task_id):
                 # No copy struck — including the case where one list was
@@ -1021,7 +973,11 @@ def build_application(
             except TodoistError as exc:
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
-            touched = sync_item(_mutation_states(context, states), task_id, done=False)
+            touched = sync_item(
+                mutation_states(context.chat_data, cfg.today(), states),
+                task_id,
+                done=False,
+            )
             logger.debug(
                 "cmd_undo task=%s: reopened, synced %d list copy(ies)",
                 task_id,
@@ -1052,20 +1008,10 @@ def build_application(
             if states is None:
                 return
             folded = query.casefold()
-            resolved = _resolve_query(states, folded)
-            if not resolved:
-                logger.debug("cmd_edit: no match (%d state(s))", len(states))
-                await _reply(update, "No match in the last shown list")
+            task_id = await _require_unique_id(update, states, folded, "cmd_edit")
+            if task_id is None:
                 return
-            if len(resolved) > 1:
-                logger.debug("cmd_edit: ambiguous, %d matches", len(resolved))
-                await _reply(
-                    update,
-                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-                )
-                return
-            task_id = resolved[0]
-            item = _find_item(states, task_id)
+            item = find_item(states, task_id)
             assert item is not None  # resolved from the same union
             if any_done(states, task_id):
                 logger.debug("cmd_edit task=%s: already done, refusing", task_id)
@@ -1077,7 +1023,9 @@ def build_application(
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
             touched = sync_item(
-                _mutation_states(context, states), task_id, text=new_text
+                mutation_states(context.chat_data, cfg.today(), states),
+                task_id,
+                text=new_text,
             )
             logger.debug(
                 "cmd_edit task=%s: renamed, synced %d list copy(ies)",
@@ -1106,20 +1054,10 @@ def build_application(
             if states is None:
                 return
             folded = query.casefold()
-            resolved = _resolve_query(states, folded)
-            if not resolved:
-                logger.debug("cmd_assign: no match (%d state(s))", len(states))
-                await _reply(update, "No match in the last shown list")
+            task_id = await _require_unique_id(update, states, folded, "cmd_assign")
+            if task_id is None:
                 return
-            if len(resolved) > 1:
-                logger.debug("cmd_assign: ambiguous, %d matches", len(resolved))
-                await _reply(
-                    update,
-                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-                )
-                return
-            task_id = resolved[0]
-            item = _find_item(states, task_id)
+            item = find_item(states, task_id)
             assert item is not None  # resolved from the same union
             if any_done(states, task_id):
                 logger.debug("cmd_assign task=%s: already done, refusing", task_id)
@@ -1177,7 +1115,9 @@ def build_application(
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
             touched = sync_item(
-                _mutation_states(context, states), task_id, assignee=assignee_name
+                mutation_states(context.chat_data, cfg.today(), states),
+                task_id,
+                assignee=assignee_name,
             )
             logger.debug(
                 "cmd_assign task=%s collaborator=%s: assigned, synced %d copy(ies)",
@@ -1210,20 +1150,10 @@ def build_application(
             if states is None:
                 return
             folded = query.casefold()
-            resolved = _resolve_query(states, folded)
-            if not resolved:
-                logger.debug("cmd_due: no match (%d state(s))", len(states))
-                await _reply(update, "No match in the last shown list")
+            task_id = await _require_unique_id(update, states, folded, "cmd_due")
+            if task_id is None:
                 return
-            if len(resolved) > 1:
-                logger.debug("cmd_due: ambiguous, %d matches", len(resolved))
-                await _reply(
-                    update,
-                    f"Ambiguous — matches {len(resolved)} tasks, be more specific",
-                )
-                return
-            task_id = resolved[0]
-            item = _find_item(states, task_id)
+            item = find_item(states, task_id)
             assert item is not None  # resolved from the same union
             if any_done(states, task_id):
                 logger.debug("cmd_due task=%s: already done, refusing", task_id)
@@ -1249,7 +1179,7 @@ def build_application(
                 "cmd_due task=%s: day=%s recurring=%s", task_id, day, is_recurring
             )
             touched = sync_item(
-                _mutation_states(context, states),
+                mutation_states(context.chat_data, cfg.today(), states),
                 task_id,
                 due=day,
                 recurring=is_recurring,

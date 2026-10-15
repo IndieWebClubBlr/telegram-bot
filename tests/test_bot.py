@@ -18,6 +18,7 @@ from iwcb_bot.bot import (
     _next_announce,
     _one_line,
     _render_list,
+    _render_list_message,
     _render_text,
 )
 from iwcb_bot.config import Config
@@ -572,3 +573,41 @@ class TestIsGroupChatType:
 
     def test_unknown_false(self) -> None:
         assert _is_group_chat_type("") is False
+
+
+class TestRenderListMessage:
+    ITEM = ListItem(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
+
+    def test_empty_returns_no_chunks(self) -> None:
+        chunks = _render_list_message([], TODAY, mentions={}, show_dates=False)
+        assert chunks == []
+
+    def test_headline_prefixes_single_chunk(self) -> None:
+        chunks = _render_list_message(
+            [self.ITEM],
+            TODAY,
+            mentions={},
+            show_dates=False,
+            headline="Daily Task Reminder",
+        )
+        assert len(chunks) == 1
+        assert chunks[0].startswith("Daily Task Reminder\n\n")
+        assert "<code>[ab]</code>" in chunks[0]
+
+    def test_cutoff_header_between_headline_and_body(self) -> None:
+        chunks = _render_list_message(
+            [self.ITEM],
+            TODAY,
+            mentions={},
+            show_dates=True,
+            cutoff=date(2026, 10, 11),
+            headline="Daily Task Reminder",
+        )
+        assert len(chunks) == 1
+        body = chunks[0]
+        assert body.startswith("Daily Task Reminder\n\n<b>Due by Sun 11 Oct:</b>")
+        assert "buy milk — due Fri 9 Oct" in body
+
+    def test_body_only_without_headline_or_cutoff(self) -> None:
+        chunks = _render_list_message([self.ITEM], TODAY, mentions={}, show_dates=False)
+        assert chunks == ["<code>[ab]</code>  buy milk"]

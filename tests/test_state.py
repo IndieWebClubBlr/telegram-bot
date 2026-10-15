@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from iwcb_bot.state import (
     ListItem,
@@ -10,16 +10,21 @@ from iwcb_bot.state import (
     any_done,
     assignee_name_candidates,
     displayed_matches,
+    find_item,
     get_chat_state,
     get_mine_states,
+    mutation_states,
     prune_mine_states,
     resolve_ids,
+    resolve_one,
+    resolve_query,
     set_chat_state,
     set_mine_state,
     sync_item,
     take_mine,
     task_suffixes,
     todoist_name_for_user,
+    union_ids,
 )
 
 TODAY = date(2026, 10, 9)
@@ -473,3 +478,133 @@ class TestAllMineStates:
     def test_empty_when_no_mine_lists(self) -> None:
         assert all_mine_states({}, TODAY) == []
         assert all_mine_states(None, TODAY) == []
+
+
+class TestUnionIds:
+    def test_empty_states(self) -> None:
+        assert union_ids([]) == []
+
+    def test_deduplicates_across_states_first_wins(self) -> None:
+        a = _state(
+            items=[ListItem(task_id="ab", text="t"), ListItem(task_id="cd", text="u")]
+        )
+        b = _state(
+            items=[ListItem(task_id="cd", text="u2"), ListItem(task_id="ef", text="v")]
+        )
+        assert union_ids([a, b]) == ["ab", "cd", "ef"]
+
+
+class TestResolveQuery:
+    """Displayed-suffix precedence over union tail matching."""
+
+    def test_empty_states(self) -> None:
+        assert resolve_query([], "ab") == []
+
+    def test_displayed_unique_beats_colliding_union(self) -> None:
+        # 'pp11' displays as '11' in its single-item list; 'qq11' sits
+        # in a multi-item list where it displays as 'q11', so its
+        # never-shown tail '11' collides in the union — the shown
+        # label wins instead of resolving ambiguously.
+        chat = _state(items=[ListItem(task_id="pp11", text="a")])
+        mine = _state(
+            items=[
+                ListItem(task_id="qq11", text="b"),
+                ListItem(task_id="r11", text="c"),
+            ]
+        )
+        assert (
+            len(resolve_ids(union_ids([chat, mine]), "11")) == 3
+        )  # would be ambiguous
+        assert resolve_query([chat, mine], "11") == ["pp11"]
+
+    def test_two_displayed_matches_fall_back_to_union(self) -> None:
+        a = _state(items=[ListItem(task_id="pp11", text="a")])
+        b = _state(items=[ListItem(task_id="tt11", text="b")])
+        assert resolve_query([a, b], "11") == ["pp11", "tt11"]
+
+    def test_full_id_match_without_display(self) -> None:
+        state = _state(items=[ListItem(task_id="abcdef", text="a")])
+        assert resolve_query([state], "abcdef") == ["abcdef"]
+
+    def test_no_match_returns_empty(self) -> None:
+        state = _state(items=[ListItem(task_id="abcdef", text="a")])
+        assert resolve_query([state], "zz") == []
+
+
+class TestResolveOne:
+    def test_none(self) -> None:
+        assert resolve_one([], "ab") == ("none", [])
+
+    def test_ok(self) -> None:
+        state = _state(items=[ListItem(task_id="abcdef", text="a")])
+        assert resolve_one([state], "abcdef") == ("ok", ["abcdef"])
+
+    def test_ambiguous(self) -> None:
+        state = _state(
+            items=[
+                ListItem(task_id="pp11", text="a"),
+                ListItem(task_id="qq11", text="b"),
+            ]
+        )
+        outcome, ids = resolve_one([state], "11")
+        assert outcome == "ambiguous"
+        assert ids == ["pp11", "qq11"]
+
+    def test_displayed_precedence_yields_ok_over_ambiguous_union(self) -> None:
+        chat = _state(items=[ListItem(task_id="pp11", text="a")])
+        mine = _state(
+            items=[
+                ListItem(task_id="qq11", text="b"),
+                ListItem(task_id="r11", text="c"),
+            ]
+        )
+        assert resolve_one([chat, mine], "11") == ("ok", ["pp11"])
+
+
+class TestFindItem:
+    def test_finds_first_stored_copy(self) -> None:
+        first = ListItem(task_id="ab", text="t")
+        a = _state(items=[first, ListItem(task_id="cd", text="u")])
+        b = _state(items=[ListItem(task_id="ab", text="t2")])
+        assert find_item([a, b], "ab") is first
+
+    def test_missing_id_returns_none(self) -> None:
+        assert find_item([], "zz") is None
+        assert (
+            find_item([_state(items=[ListItem(task_id="ab", text="t")])], "zz") is None
+        )
+
+
+class TestMutationStates:
+    def test_appends_other_users_mine_states(self) -> None:
+        chat_state = _state(items=[ListItem(task_id="ab", text="t")])
+        other = _state(items=[ListItem(task_id="ab", text="t")])
+        chat_data: dict[str, object] = {}
+        set_mine_state(chat_data, 222, other)
+        result = mutation_states(chat_data, TODAY, [chat_state])
+        assert len(result) == 2
+        assert result[0] is chat_state
+        assert result[1] is other
+
+    def test_identity_dedup_includes_shared_state_once(self) -> None:
+        # The sender's own /mine is already in the resolution states;
+        # the merge must not visit the same object twice (sync_item
+        # appends one entry per matching state).
+        shared = _state(items=[ListItem(task_id="ab", text="t")])
+        chat_data: dict[str, object] = {}
+        set_mine_state(chat_data, 222, shared)
+        result = mutation_states(chat_data, TODAY, [shared])
+        assert len(result) == 1
+        assert result[0] is shared
+
+    def test_stale_mine_pruned_from_scope(self) -> None:
+        stale = _state(
+            day=TODAY - timedelta(days=1),
+            items=[ListItem(task_id="ab", text="t")],
+        )
+        chat_data: dict[str, object] = {}
+        set_mine_state(chat_data, 222, stale)
+        assert mutation_states(chat_data, TODAY, []) == []
+
+    def test_empty_inputs(self) -> None:
+        assert mutation_states({}, TODAY, []) == []

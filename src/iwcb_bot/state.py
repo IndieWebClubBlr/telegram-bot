@@ -10,9 +10,12 @@ from __future__ import annotations
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 T = TypeVar("T")
+
+# resolve_one's decision: no match, more than one, or exactly one.
+ResolutionOutcome = Literal["none", "ambiguous", "ok"]
 
 _CHAT_LIST_KEY = "list"
 _MINE_LISTS_KEY = "mine"
@@ -116,6 +119,43 @@ def displayed_matches(states: list[ListState], folded: str) -> list[str]:
     return matches
 
 
+def union_ids(states: list[ListState]) -> list[str]:
+    """Task ids across all states, deduplicated (first wins)."""
+    return list(dict.fromkeys(item.task_id for state in states for item in state.items))
+
+
+def resolve_query(states: list[ListState], folded: str) -> list[str]:
+    """Resolve a typed id against the given lists.
+
+    Prefers an exact match of a *displayed* short suffix (the label
+    the user copied from a message); a shown label can otherwise
+    collide with a never-displayed tail in the other list and be
+    rejected as ambiguous.  Falls back to exact/tail matching over
+    the union of both lists.
+    """
+    displayed = displayed_matches(states, folded)
+    if len(displayed) == 1:
+        return displayed
+    return resolve_ids(union_ids(states), folded)
+
+
+def resolve_one(
+    states: list[ListState], folded: str
+) -> tuple[ResolutionOutcome, list[str]]:
+    """resolve_query reduced to the single-match decision /done, /undo,
+    /edit, /assign and /due share.
+
+    Returns ("none", []) when nothing matches, ("ambiguous", matches)
+    for more than one, and ("ok", [task_id]) for exactly one.
+    """
+    resolved = resolve_query(states, folded)
+    if not resolved:
+        return "none", []
+    if len(resolved) > 1:
+        return "ambiguous", resolved
+    return "ok", resolved
+
+
 def get_chat_state(
     chat_data: MutableMapping[str, Any] | None,
 ) -> ListState | None:
@@ -216,6 +256,37 @@ def all_mine_states(
     """
     prune_mine_states(chat_data, today)
     return list(get_mine_states(chat_data).values())
+
+
+def mutation_states(
+    chat_data: MutableMapping[str, Any] | None,
+    today: date,
+    states: list[ListState],
+) -> list[ListState]:
+    """Resolution states plus every user's /mine, identity-deduped.
+
+    IDs resolve against the sender's lists only (active_states), but
+    the mutation must land on every stored copy: an unstruck /mine
+    copy in another user's list would pass the already-done guard and
+    complete a recurring task a second time.  A state already in
+    `states` is included by identity, so it must not be visited twice.
+    """
+    merged = [*states, *all_mine_states(chat_data, today)]
+    seen: set[int] = set()
+    unique: list[ListState] = []
+    for state in merged:
+        if id(state) not in seen:
+            seen.add(id(state))
+            unique.append(state)
+    return unique
+
+
+def find_item(states: list[ListState], task_id: str) -> ListItem | None:
+    """The first stored copy of the task, or None when no list has it."""
+    return next(
+        (item for state in states for item in state.items if item.task_id == task_id),
+        None,
+    )
 
 
 def sync_item(
