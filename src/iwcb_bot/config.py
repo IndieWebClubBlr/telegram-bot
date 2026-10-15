@@ -26,6 +26,9 @@ class Config:
     assignee_mentions: dict[str, str] = field(default_factory=dict)
     # Logging level name (DEBUG/INFO/WARNING/ERROR), from LOG_LEVEL.
     log_level: str = "INFO"
+    # Whether the daily announcement is sent when nothing is due
+    # (MORNING_ANNOUNCE_WHEN_EMPTY=true|false, default true).
+    morning_announce_when_empty: bool = True
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -39,6 +42,7 @@ class Config:
             morning_announce_time=_parse_morning_time(env),
             assignee_mentions=_parse_assignee_mentions(env),
             log_level=_parse_log_level(env),
+            morning_announce_when_empty=_parse_morning_announce_when_empty(env),
         )
 
     def today(self) -> date:
@@ -114,6 +118,26 @@ def _parse_morning_time(env: Mapping[str, str]) -> time | None:
             f"MORNING_ANNOUNCE_TIME is not an HH:MM time or 'off': {raw!r} "
             "(expected e.g. 09:00)"
         ) from exc
+
+
+def _parse_morning_announce_when_empty(env: Mapping[str, str]) -> bool:
+    """MORNING_ANNOUNCE_WHEN_EMPTY: 'true' or 'false' (case-insensitive).
+
+    Unset defaults to true (the historical behavior: an empty day gets
+    the title over "Nothing due today").  false keeps the morning
+    announcement silent when there is nothing to remind about.
+    """
+    original = env.get("MORNING_ANNOUNCE_WHEN_EMPTY", "").strip()
+    if not original:
+        return True
+    value = original.casefold()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ConfigError(
+        f"MORNING_ANNOUNCE_WHEN_EMPTY is not 'true' or 'false': {original!r}"
+    )
 
 
 def _parse_assignee_mentions(env: Mapping[str, str]) -> dict[str, str]:

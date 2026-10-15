@@ -567,6 +567,8 @@ async def _send_morning_list(
     mentions: dict[str, str],
     todoist: TodoistClient,
     project_id: str,
+    *,
+    send_when_empty: bool,
 ) -> None:
     """Send the morning list to one chat and store it as that chat's state.
 
@@ -574,7 +576,10 @@ async def _send_morning_list(
     message becomes the last shown list, so /done, /undo and /edit work
     on it immediately (the title survives strikes via the stored
     headline).  Sent to the chat root (no message_thread_id → the
-    General topic in forum groups).  Caller holds the chat lock.
+    General topic in forum groups).  When nothing is due and
+    send_when_empty is false (MORNING_ANNOUNCE_WHEN_EMPTY=false), no
+    message is sent, but the chat's stored list is still cleared so
+    yesterday's message stops updating.  Caller holds the chat lock.
     """
     chat_data = application.chat_data[chat_id]
     items = await _build_items(tasks, todoist, project_id)
@@ -588,11 +593,12 @@ async def _send_morning_list(
     )
     if not chunks:
         set_chat_state(chat_data, None)
-        await application.bot.send_message(
-            chat_id=chat_id,
-            text=f"{_MORNING_TITLE}\n\nNothing due today 🎉",
-            parse_mode=ParseMode.HTML,
-        )
+        if send_when_empty:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=f"{_MORNING_TITLE}\n\nNothing due today 🎉",
+                parse_mode=ParseMode.HTML,
+            )
         return
     message_id = await _send_chunks(
         lambda text: application.bot.send_message(
@@ -702,6 +708,7 @@ async def _morning_loop(
                                 mentions,
                                 todoist,
                                 project.id,
+                                send_when_empty=cfg.morning_announce_when_empty,
                             )
                             logger.debug("morning chat=%s: sent", chat_id)
                     except Exception:

@@ -61,7 +61,9 @@ the configured wall-clock time
 shown list — `/done`, `/undo` and `/edit` work on it immediately, no fresh
 `/today` needed, and the title stays visible as lines are struck. In forum
 groups the message lands in the General topic (commands still answer in their
-own topic). An empty day gets the title over "Nothing due today 🎉"; a Todoist
+own topic). An empty day gets the title over "Nothing due today 🎉", or
+nothing at all with `MORNING_ANNOUNCE_WHEN_EMPTY=false` (the chat's stored
+list from the previous day is retired either way); a Todoist
 failure is reported in-chat so silence is never mistaken for "nothing due".
 If the bot is down at the scheduled time, the list is not re-sent until the
 next day.
@@ -80,6 +82,7 @@ errors) — plus a few optional ones:
 | `ALLOWED_CHAT_IDS` | Comma-separated Telegram chat IDs allowed to use the bot. Group IDs are negative (e.g. `-1001234567890`) — learn one by forwarding a group message to an ID-reporting bot such as [@getidsbot](https://t.me/getidsbot) |
 | `TIMEZONE` | Optional IANA time zone for the bot's "today" calculations (e.g. `Asia/Kolkata`). The server and the bot's users are often in different time zones, so set this explicitly; an invalid value aborts startup with exit code 2. Falls back to the server's local time zone — but only its offset at startup, so on a DST-observing server the morning reminder drifts by an hour after a transition until restart; set `TIMEZONE` to avoid this. Naive due datetimes (the normal Todoist shape) are taken as wall-clock times in this zone; timezone-aware dues are converted into it before the calendar day is taken |
 | `MORNING_ANNOUNCE_TIME` | Optional wall-clock time (24h `HH:MM`, in the `TIMEZONE` zone) at which the bot proactively sends the day's task list to every allowed group chat (private chats are skipped). Defaults to `09:00`; set to `off` to disable. An invalid value aborts startup with exit code 2 |
+| `MORNING_ANNOUNCE_WHEN_EMPTY` | `true` (default) or `false` — whether the daily list is sent when nothing is due. `true` posts the title over "Nothing due today 🎉"; `false` stays silent and clears the chat's stored list so the previous day's message stops updating. Case-insensitive; an invalid value aborts startup with exit code 2 |
 | `ASSIGNEE_MENTIONS` | Optional `;`-separated `Todoist Name=Telegram` pairs mapping shared-project assignee names to Telegram mentions — `Abhinav Nair=@abnv;Priya Singh=123456789`. Names match case-insensitively; mapped names render as clickable mentions, unmapped assignees as plain text, unassigned tasks show no suffix. Names and targets must each be unique (compared case-insensitively) — a duplicate aborts startup with exit code 2 |
 | `LOG_LEVEL` | Optional bot log level: `DEBUG`, `INFO`, `WARNING` or `ERROR` (case-insensitive). Defaults to `INFO`. `DEBUG` logs each command action and Todoist API call with durations, and includes numeric chat/user/task ids for correlation — it never logs names, usernames, chat titles, task text or command arguments. An invalid value aborts startup with exit code 2 |
 

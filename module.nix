@@ -19,6 +19,7 @@ let
       TODOIST_PROJECT_ID=${cfg.projectId}
       ALLOWED_CHAT_IDS=${lib.concatMapStringsSep "," toString cfg.allowedChatIds}
       MORNING_ANNOUNCE_TIME=${cfg.morningAnnounceTime}
+      MORNING_ANNOUNCE_WHEN_EMPTY=${lib.boolToString cfg.morningAnnounceWhenEmpty}
       LOG_LEVEL=${cfg.logLevel}
     ''
     + lib.optionalString (cfg.timeZone != null) "TIMEZONE=${cfg.timeZone}\n"
@@ -88,6 +89,18 @@ in
         /done, /undo and /edit work on it immediately. Set to "off"
         to disable the daily announcement. If the bot is down at the
         scheduled time, the list is not re-sent until the next day.
+      '';
+    };
+
+    morningAnnounceWhenEmpty = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Whether the daily announcement is sent when nothing is due
+        (MORNING_ANNOUNCE_WHEN_EMPTY). true (the default) posts the
+        title over "Nothing due today"; false stays silent and clears
+        the chat's stored list so the previous day's message stops
+        updating.
       '';
     };
 

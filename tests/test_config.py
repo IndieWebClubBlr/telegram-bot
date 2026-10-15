@@ -185,6 +185,36 @@ class TestMorningAnnounceTime:
             make_config(MORNING_ANNOUNCE_TIME=raw)
 
 
+class TestMorningAnnounceWhenEmpty:
+    def test_default_is_true(self) -> None:
+        assert make_config().morning_announce_when_empty is True
+
+    def test_unset_is_true(self) -> None:
+        cfg = make_config(MORNING_ANNOUNCE_WHEN_EMPTY="")
+        assert cfg.morning_announce_when_empty is True
+
+    def test_true_parses(self) -> None:
+        cfg = make_config(MORNING_ANNOUNCE_WHEN_EMPTY="true")
+        assert cfg.morning_announce_when_empty is True
+
+    def test_false_parses(self) -> None:
+        cfg = make_config(MORNING_ANNOUNCE_WHEN_EMPTY="false")
+        assert cfg.morning_announce_when_empty is False
+
+    def test_case_insensitive(self) -> None:
+        cfg = make_config(MORNING_ANNOUNCE_WHEN_EMPTY="False")
+        assert cfg.morning_announce_when_empty is False
+
+    def test_padded_value_accepted(self) -> None:
+        cfg = make_config(MORNING_ANNOUNCE_WHEN_EMPTY="  false  ")
+        assert cfg.morning_announce_when_empty is False
+
+    @pytest.mark.parametrize("raw", ["yes", "no", "1", "0", "off"])
+    def test_invalid_rejected(self, raw: str) -> None:
+        with pytest.raises(ConfigError, match="MORNING_ANNOUNCE_WHEN_EMPTY"):
+            make_config(MORNING_ANNOUNCE_WHEN_EMPTY=raw)
+
+
 class TestSecrets:
     def test_repr_masks_tokens(self) -> None:
         cfg = make_config()
