@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-import pytest
-
 from iwcb_bot.state import (
     Ambiguous,
     Applied,
@@ -27,7 +25,6 @@ from iwcb_bot.state import (
     get_chat_list,
     get_mine_lists,
     get_tasks,
-    is_done,
     lists_displaying,
     prune_mine_lists,
     prune_tasks,
@@ -43,7 +40,6 @@ from iwcb_bot.state import (
     task_suffixes,
     todoist_name_for_user,
     union_ids,
-    update_task,
 )
 
 TODAY = date(2026, 10, 9)
@@ -344,19 +340,6 @@ class TestTaskMap:
         assert get_tasks(data) == {}
 
 
-class TestIsDone:
-    def test_missing_record_is_false(self) -> None:
-        assert is_done({}, "ab") is False
-
-    def test_single_record_flag(self) -> None:
-        assert is_done({"ab": _task("ab")}, "ab") is False
-        assert is_done({"ab": _task("ab", done=True)}, "ab") is True
-
-    def test_other_task_irrelevant(self) -> None:
-        tasks = {"ab": _task("ab"), "cd": _task("cd", done=True)}
-        assert is_done(tasks, "ab") is False
-
-
 class TestListsDisplaying:
     def test_empty_chat_data(self) -> None:
         assert lists_displaying({}, TODAY, "ab") == []
@@ -386,112 +369,6 @@ class TestListsDisplaying:
         set_mine_list(data, 2, stale_mine)
         put_tasks(data, [_task("ab")])
         assert lists_displaying(data, TODAY, "ab") == []
-
-
-class TestUpdateTask:
-    def test_missing_entity_is_a_programming_error(self) -> None:
-        data = _chat_data(chat=_tasklist(ids=["zz"]))
-        with pytest.raises(AssertionError):
-            update_task(data, TODAY, "zz", done=True)
-
-    def test_update_task_touched_covers_all_displaying_lists(self) -> None:
-        chat = _tasklist(ids=["ab"])
-        mine = _tasklist(ids=["ab"])
-        data = _chat_data(chat=chat, mine={2: mine}, tasks=[_task("ab")])
-        touched = update_task(data, TODAY, "ab", done=True)
-        assert touched == [chat, mine]
-        assert get_tasks(data)["ab"].done is True
-
-    def test_only_matching_task_updated(self) -> None:
-        data = _chat_data(
-            chat=_tasklist(ids=["ab", "cd"]),
-            tasks=[_task("ab"), _task("cd", text="other")],
-        )
-        update_task(data, TODAY, "ab", text="new")
-        assert get_tasks(data)["ab"].text == "new"
-        assert get_tasks(data)["cd"].text == "other"
-
-    def test_text_and_due_update(self) -> None:
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab", text="old")])
-        update_task(data, TODAY, "ab", text="new", due=date(2026, 10, 12))
-        task = get_tasks(data)["ab"]
-        assert task.text == "new"
-        assert task.due == date(2026, 10, 12)
-
-    def test_due_none_clears_date(self) -> None:
-        # /due <id> no date — explicit None means "clear", not "leave".
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab")])
-        update_task(data, TODAY, "ab", due=None)
-        assert get_tasks(data)["ab"].due is None
-
-    def test_due_default_leaves_date_alone(self) -> None:
-        # A caller that says nothing about the date (e.g. /done on a
-        # non-recurring task) must not clear it.
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab")])
-        update_task(data, TODAY, "ab", done=True)
-        assert get_tasks(data)["ab"].due == TODAY
-
-    def test_done_with_rolled_due_sets_both(self) -> None:
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab")])
-        update_task(data, TODAY, "ab", done=True, due=date(2026, 10, 17))
-        task = get_tasks(data)["ab"]
-        assert task.done is True
-        assert task.due == date(2026, 10, 17)
-
-    def test_none_fields_leave_record_alone(self) -> None:
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab")])
-        update_task(data, TODAY, "ab")
-        task = get_tasks(data)["ab"]
-        assert task.done is False and task.text == "t" and task.due == TODAY
-
-    def test_assignee_update(self) -> None:
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab")])
-        update_task(data, TODAY, "ab", assignee="Priya Singh")
-        assert get_tasks(data)["ab"].assignee == "Priya Singh"
-
-    def test_assignee_none_leaves_record_alone(self) -> None:
-        data = _chat_data(
-            chat=_tasklist(ids=["ab"]), tasks=[_task("ab", assignee="Old Name")]
-        )
-        update_task(data, TODAY, "ab", assignee=None)
-        assert get_tasks(data)["ab"].assignee == "Old Name"
-
-    def test_recurring_flipped_on(self) -> None:
-        # /due 5c every friday on a one-off — the flag must follow, or
-        # later /done skips the roll fetch and /undo misses its guard.
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab")])
-        update_task(data, TODAY, "ab", recurring=True)
-        assert get_tasks(data)["ab"].recurring is True
-
-    def test_recurring_flipped_off(self) -> None:
-        data = _chat_data(
-            chat=_tasklist(ids=["ab"]), tasks=[_task("ab", recurring=True)]
-        )
-        update_task(data, TODAY, "ab", recurring=False)
-        assert get_tasks(data)["ab"].recurring is False
-
-    def test_recurring_default_leaves_flag_alone(self) -> None:
-        data = _chat_data(
-            chat=_tasklist(ids=["ab"]), tasks=[_task("ab", recurring=True)]
-        )
-        update_task(data, TODAY, "ab", done=True)
-        assert get_tasks(data)["ab"].recurring is True
-
-    def test_replaces_entity_not_mutates(self) -> None:
-        original = _task("ab")
-        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[original])
-        update_task(data, TODAY, "ab", done=True, text="new")
-        assert original.done is False
-        assert original.text == "t"
-        assert get_tasks(data)["ab"] is not original
-        assert get_tasks(data)["ab"].done is True
-
-    def test_unreferenced_record_returns_empty_touched(self) -> None:
-        # An entity in the map with no stored list (builders put before
-        # they store) still updates; nothing to re-edit.
-        data: dict[str, object] = {}
-        put_tasks(data, [_task("ab")])
-        assert update_task(data, TODAY, "ab", done=True) == []
 
 
 class TestMineLists:
@@ -649,8 +526,10 @@ class TestRejectReason:
         assert reject_reason(done, "ab", Reopen()) is None
 
     def test_reopen_recurring_record_rejected(self) -> None:
+        # Phase first (partner ruling): an ACTIVE recurring task reads
+        # not_completed, so /undo's wording stays byte-identical.
         active = {"ab": _task("ab", recurring=True)}
-        assert reject_reason(active, "ab", Reopen()) == "recurring"
+        assert reject_reason(active, "ab", Reopen()) == "not_completed"
         done = {"ab": _task("ab", done=True, recurring=True)}
         assert reject_reason(done, "ab", Reopen()) == "recurring"
 

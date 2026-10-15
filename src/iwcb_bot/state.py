@@ -28,9 +28,10 @@ _TASKS_KEY = "tasks"
 class _UnsetType:
     """Marker distinguishing "parameter not mentioned" from None.
 
-    update_task's due needs both: None clears a task's date (/due no
-    date), while a caller that says nothing about the date must leave
-    it alone — impossible if None doubled as both meanings.
+    Complete's due needs both: None is unrepresentable (no clearing a
+    date by completing), while a caller that says nothing about the
+    date must leave it alone — impossible if None doubled as both
+    meanings.
     """
 
     __slots__ = ()
@@ -167,8 +168,8 @@ def resolve_one(
 def get_tasks(chat_data: MutableMapping[str, Any] | None) -> dict[str, Task]:
     """The chat's live task map (task id → entity), if any.
 
-    Returns the stored dict itself — callers write through it via
-    put_tasks/update_task or prune_tasks, never a copy.
+    Returns the stored dict itself — writers (put_tasks, commit) and
+    prune_tasks go through it, never a copy.
     """
     if chat_data is None:
         return {}
@@ -305,29 +306,14 @@ def active_lists(
     return states
 
 
-def is_done(tasks: dict[str, Task], task_id: str) -> bool:
-    """The single record's done flag (transitional — begin/commit in Task 3).
-
-    Replaces the old any_done vote across per-list copies: with one
-    map record there is nothing to diverge, and the /done and /undo
-    guards read it directly.  An id no list references anymore (so it
-    is not in the map) reads False — the caller's resolution already
-    rejected such ids before this is consulted.
-    """
-    item = tasks.get(task_id)
-    return item is not None and item.done
-
-
 def lists_displaying(
     chat_data: MutableMapping[str, Any] | None, today: date, task_id: str
 ) -> list[TaskList]:
     """Today's stored lists whose id order contains the task.
 
-    Transitional — begin/commit owns this in Task 3.  The chat list
-    first, then every user's /mine in insertion order — the same
-    re-edit set the old sync_item fan-out returned, now derived from
-    one record instead of copies.  Callers re-edit each returned
-    list's message after a write.
+    The chat list first, then every user's /mine in insertion order —
+    the re-edit set commit returns in Applied.touched: only the shared
+    record changed, and every list message showing it is re-rendered.
     """
     out: list[TaskList] = []
     chat = get_chat_list(chat_data)
@@ -337,47 +323,6 @@ def lists_displaying(
         if task_list.day == today and task_id in task_list.task_ids:
             out.append(task_list)
     return out
-
-
-def update_task(
-    chat_data: MutableMapping[str, Any] | None,
-    today: date,
-    task_id: str,
-    *,
-    done: bool | None = None,
-    text: str | None = None,
-    due: date | None | _UnsetType = UNSET,
-    assignee: str | None = None,
-    recurring: bool | None = None,
-) -> list[TaskList]:
-    """Apply a mutation to the single map record and return its lists.
-
-    Transitional shim — DELETED in Task 3 once the handlers call
-    begin/commit (which write the record instead); until then the
-    handlers already pass chat_data so the move is mechanical.  due
-    follows sentinel semantics: UNSET (the default) leaves the date
-    alone, a date sets it, and None clears it (/due no date).
-    recurring is passed by /due, which can flip a task between one-off
-    and a series.  The record must already be in the map — builders
-    put entities before storing lists — so a missing id is a broken
-    invariant, not a no-op.
-    """
-    tasks = get_tasks(chat_data)
-    item = tasks.get(task_id)
-    assert item is not None, f"task {task_id} missing from the chat's map"
-    updates: dict[str, Any] = {}
-    if done is not None:
-        updates["done"] = done
-    if text is not None:
-        updates["text"] = text
-    if not isinstance(due, _UnsetType):
-        updates["due"] = due
-    if assignee is not None:
-        updates["assignee"] = assignee
-    if recurring is not None:
-        updates["recurring"] = recurring
-    tasks[task_id] = replace(item, **updates)
-    return lists_displaying(chat_data, today, task_id)
 
 
 ItemPhase = Literal["active", "completed"]
@@ -483,21 +428,24 @@ def reject_reason(
     | event                | from active                | from completed            |
     |----------------------|----------------------------|---------------------------|
     | Complete             | ok → completed             | already_completed         |
-    | Reopen               | recurring if recurring     | ok → active               |
-    |                      | else not_completed         | (recurring: recurring)    |
+    | Reopen               | not_completed              | ok → active               |
+    |                      |                            | (recurring: recurring)    |
     | Edit/Assign/Resched. | ok, stays active           | already_completed         |
 
-    None means permitted.  Phase is one record — no aggregation.
+    None means permitted.  Phase is one record — no aggregation.  The
+    Reopen row checks phase before the recurring flag (partner ruling):
+    the recurring refusal only bites on a completed record, so /undo on
+    an active recurring task keeps the "not completed" wording.
     """
     item = tasks.get(task_id)
-    if isinstance(event, Reopen) and item is not None and item.recurring:
-        return "recurring"
     if isinstance(event, Complete):
         return (
             "already_completed" if task_phase(tasks, task_id) == "completed" else None
         )
     if isinstance(event, Reopen):
-        return None if task_phase(tasks, task_id) == "completed" else "not_completed"
+        if task_phase(tasks, task_id) != "completed":
+            return "not_completed"
+        return "recurring" if item is not None and item.recurring else None
     return "already_completed" if task_phase(tasks, task_id) == "completed" else None
 
 
