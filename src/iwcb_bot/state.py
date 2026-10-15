@@ -390,7 +390,12 @@ class Rejected:
 
 @dataclass(frozen=True)
 class Permitted:
-    """Begin outcome: resolve + validate passed; item is a read snapshot."""
+    """Begin outcome: resolve + validate passed; item is the live entity.
+
+    Read-only by contract: callers (handler replies) read item.text /
+    item.recurring but never mutate it — apply_event replaces, never
+    edits in place.
+    """
 
     task_id: str
     item: Task
@@ -478,9 +483,10 @@ def begin(
 ) -> BeginOutcome:
     """Resolve + validate without writing — the handler's pre-API gate.
 
-    Prunes stale /mine lists (active_lists), resolves `folded` against
-    the sender's visible lists only, then checks the event against the
-    single record's phase.  Pure read: writes nothing.
+    Prunes stale /mine lists (active_lists — the pre-FSM behavior),
+    resolves `folded` against the sender's visible lists only, then
+    checks the event against the single record's phase.  Writes
+    nothing beyond that prune; records and today's lists are untouched.
     """
     lists = active_lists(chat_data, user_id, today)
     outcome, ids = resolve_one(lists, folded)

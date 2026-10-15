@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import pytest
+
 from iwcb_bot.state import (
     Ambiguous,
     Applied,
@@ -370,6 +372,11 @@ class TestListsDisplaying:
         put_tasks(data, [_task("ab")])
         assert lists_displaying(data, TODAY, "ab") == []
 
+    def test_mine_only_without_chat_list(self) -> None:
+        mine = _tasklist(ids=["ab"])
+        data = _chat_data(mine={2: mine})
+        assert lists_displaying(data, TODAY, "ab") == [mine]
+
 
 class TestMineLists:
     def test_set_get_roundtrip(self) -> None:
@@ -406,6 +413,15 @@ class TestMineLists:
         chat_data: dict[str, object] = {"other": 1}
         prune_mine_lists(chat_data, TODAY)
         assert chat_data == {"other": 1}
+
+    def test_mine_setter_runs_prune(self) -> None:
+        # Mirror of the chat-setter prune test: deleting the set_mine_list
+        # prune hook would otherwise pass the battery unnoticed.
+        data = _chat_data(chat=_tasklist(ids=["ab"]), tasks=[_task("ab"), _task("cd")])
+        set_mine_list(data, 2, _tasklist(ids=["cd"]))
+        assert set(get_tasks(data)) == {"ab", "cd"}  # both still referenced
+        set_mine_list(data, 2, None)
+        assert set(get_tasks(data)) == {"ab"}  # mine-only "cd" freed
 
 
 class TestActiveLists:
@@ -581,6 +597,15 @@ class TestApplyEvent:
         out = apply_event(_task("ab"), Reschedule(due=None, recurring=False))
         assert out.due is None
 
+    def test_reschedule_flips_recurring_off(self) -> None:
+        # /due a rolled series back to a one-off — the flag must follow,
+        # or later /undo hits the recurring refusal it should not.
+        out = apply_event(
+            _task("ab", due=TODAY, recurring=True),
+            Reschedule(due=TODAY, recurring=False),
+        )
+        assert out.recurring is False
+
 
 class TestBegin:
     def test_unresolved_reports_list_count(self) -> None:
@@ -626,6 +651,13 @@ class TestBegin:
         assert get_chat_list(data) is chat
         assert get_mine_lists(data) == mine
         assert get_tasks(data) == {"ab": entity}
+
+    def test_missing_entity_is_a_programming_error(self) -> None:
+        # A resolved id whose entity vanished breaks the storage
+        # invariant — assert, never a silent Not-found-later path.
+        data = _chat_data(chat=_tasklist(ids=["zz"]))
+        with pytest.raises(AssertionError, match="missing from the chat's map"):
+            begin(data, 1, TODAY, "zz", Complete())
 
 
 class TestCommit:
@@ -679,3 +711,8 @@ class TestCommit:
         stored = get_tasks(data)["ab"]
         assert stored is not original
         assert original.text == "old"
+
+    def test_missing_entity_is_a_programming_error(self) -> None:
+        data = _chat_data(chat=_tasklist(ids=["zz"]))
+        with pytest.raises(AssertionError, match="missing from the chat's map"):
+            commit(data, 1, TODAY, "zz", Complete())

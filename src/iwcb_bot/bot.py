@@ -944,6 +944,8 @@ def build_application(
                 ok.task_id,
                 Complete(due=next_due if next_due is not None else UNSET),
             )
+            # Unreachable in practice: sequential updates under the
+            # chat lock keep the phase stable between begin and commit.
             assert isinstance(applied, Applied)
             logger.debug(
                 "cmd_done task=%s: completed, updated %d displaying list(s)",
@@ -1007,6 +1009,8 @@ def build_application(
             applied = commit(
                 context.chat_data, user.id, cfg.today(), ok.task_id, Reopen()
             )
+            # Unreachable in practice: sequential updates under the
+            # chat lock keep the phase stable between begin and commit.
             assert isinstance(applied, Applied)
             logger.debug(
                 "cmd_undo task=%s: reopened, updated %d displaying list(s)",
@@ -1063,6 +1067,8 @@ def build_application(
                 await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
                 return
             applied = commit(context.chat_data, user.id, cfg.today(), ok.task_id, event)
+            # Unreachable in practice: sequential updates under the
+            # chat lock keep the phase stable between begin and commit.
             assert isinstance(applied, Applied)
             logger.debug(
                 "cmd_edit task=%s: renamed, updated %d displaying list(s)",
@@ -1175,6 +1181,8 @@ def build_application(
                 ok.task_id,
                 Assign(assignee=assignee_name),
             )
+            # Unreachable in practice: sequential updates under the
+            # chat lock keep the phase stable between begin and commit.
             assert isinstance(applied, Applied)
             logger.debug(
                 "cmd_assign task=%s collaborator=%s: assigned, updated %d list(s)",
@@ -1257,6 +1265,8 @@ def build_application(
                 ok.task_id,
                 Reschedule(due=day, recurring=is_recurring),
             )
+            # Unreachable in practice: sequential updates under the
+            # chat lock keep the phase stable between begin and commit.
             assert isinstance(applied, Applied)
             await _edit_lists(
                 update,
