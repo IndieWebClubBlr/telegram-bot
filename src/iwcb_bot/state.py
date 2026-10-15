@@ -352,7 +352,8 @@ def update_task(
 ) -> list[TaskList]:
     """Apply a mutation to the single map record and return its lists.
 
-    Transitional shim until begin/commit (typed FSM) replaces it; the
+    Transitional shim — DELETED in Task 3 once the handlers call
+    begin/commit (which write the record instead); until then the
     handlers already pass chat_data so the move is mechanical.  due
     follows sentinel semantics: UNSET (the default) leaves the date
     alone, a date sets it, and None clears it (/due no date).
@@ -377,6 +378,202 @@ def update_task(
         updates["recurring"] = recurring
     tasks[task_id] = replace(item, **updates)
     return lists_displaying(chat_data, today, task_id)
+
+
+ItemPhase = Literal["active", "completed"]
+RejectedReason = Literal["already_completed", "not_completed", "recurring"]
+
+
+@dataclass(frozen=True)
+class Complete:
+    """User event: /done — strike the record (optionally to a rolled date)."""
+
+    due: date | _UnsetType = UNSET
+
+
+@dataclass(frozen=True)
+class Reopen:
+    """User event: /undo — clear the strike."""
+
+
+@dataclass(frozen=True)
+class Edit:
+    """User event: /edit — replace the task text."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class Assign:
+    """User event: /assign — set the assignee (Todoist-authoritative name)."""
+
+    assignee: str
+
+
+@dataclass(frozen=True)
+class Reschedule:
+    """User event: /due — set or clear the date; recurring from server truth."""
+
+    due: date | None
+    recurring: bool
+
+
+Event = Complete | Reopen | Edit | Assign | Reschedule
+
+
+@dataclass(frozen=True)
+class Unresolved:
+    """Begin outcome: no list matched; list_count feeds the no-match log."""
+
+    list_count: int
+
+
+@dataclass(frozen=True)
+class Ambiguous:
+    """Begin outcome: the folded suffix matched several ids."""
+
+    count: int
+
+
+@dataclass(frozen=True)
+class Rejected:
+    """The validation table refused (begin and commit both produce it)."""
+
+    reason: RejectedReason
+    task_id: str
+
+
+@dataclass(frozen=True)
+class Permitted:
+    """Begin outcome: resolve + validate passed; item is a read snapshot."""
+
+    task_id: str
+    item: Task
+
+
+BeginOutcome = Unresolved | Ambiguous | Rejected | Permitted
+
+
+@dataclass(frozen=True)
+class Applied:
+    """Commit outcome: record written; handlers re-edit exactly `touched`."""
+
+    touched: list[TaskList]
+
+
+CommitOutcome = Rejected | Applied
+
+
+def task_phase(tasks: dict[str, Task], task_id: str) -> ItemPhase:
+    """The single record's phase — active or completed.
+
+    A referenced id is always in the map (storage invariant), so a
+    miss means nothing references it: it reads active rather than
+    guessing completed.
+    """
+    item = tasks.get(task_id)
+    return "completed" if item is not None and item.done else "active"
+
+
+def reject_reason(
+    tasks: dict[str, Task], task_id: str, event: Event
+) -> RejectedReason | None:
+    """The validation table for one event against one record's phase.
+
+    | event                | from active                | from completed            |
+    |----------------------|----------------------------|---------------------------|
+    | Complete             | ok → completed             | already_completed         |
+    | Reopen               | recurring if recurring     | ok → active               |
+    |                      | else not_completed         | (recurring: recurring)    |
+    | Edit/Assign/Resched. | ok, stays active           | already_completed         |
+
+    None means permitted.  Phase is one record — no aggregation.
+    """
+    item = tasks.get(task_id)
+    if isinstance(event, Reopen) and item is not None and item.recurring:
+        return "recurring"
+    if isinstance(event, Complete):
+        return (
+            "already_completed" if task_phase(tasks, task_id) == "completed" else None
+        )
+    if isinstance(event, Reopen):
+        return None if task_phase(tasks, task_id) == "completed" else "not_completed"
+    return "already_completed" if task_phase(tasks, task_id) == "completed" else None
+
+
+def apply_event(item: Task, event: Event) -> Task:
+    """Pure field update for a permitted event — returns a NEW entity.
+
+    The map entry is replaced, never mutated; lists are unaffected
+    because they hold ids only.
+    """
+    if isinstance(event, Complete):
+        updates: dict[str, Any] = {"done": True}
+        if not isinstance(event.due, _UnsetType):
+            updates["due"] = event.due
+        return replace(item, **updates)
+    if isinstance(event, Reopen):
+        return replace(item, done=False)
+    if isinstance(event, Edit):
+        return replace(item, text=event.text)
+    if isinstance(event, Assign):
+        return replace(item, assignee=event.assignee)
+    return replace(item, due=event.due, recurring=event.recurring)
+
+
+def begin(
+    chat_data: MutableMapping[str, Any] | None,
+    user_id: int,
+    today: date,
+    folded: str,
+    event: Event,
+) -> BeginOutcome:
+    """Resolve + validate without writing — the handler's pre-API gate.
+
+    Prunes stale /mine lists (active_lists), resolves `folded` against
+    the sender's visible lists only, then checks the event against the
+    single record's phase.  Pure read: writes nothing.
+    """
+    lists = active_lists(chat_data, user_id, today)
+    outcome, ids = resolve_one(lists, folded)
+    if outcome == "none":
+        return Unresolved(list_count=len(lists))
+    if outcome == "ambiguous":
+        return Ambiguous(count=len(ids))
+    task_id = ids[0]
+    tasks = get_tasks(chat_data)
+    item = tasks.get(task_id)
+    assert item is not None, f"resolved task {task_id} missing from the chat's map"
+    reason = reject_reason(tasks, task_id, event)
+    if reason is not None:
+        return Rejected(reason=reason, task_id=task_id)
+    return Permitted(task_id=task_id, item=item)
+
+
+def commit(
+    chat_data: MutableMapping[str, Any] | None,
+    user_id: int,
+    today: date,
+    task_id: str,
+    event: Event,
+) -> CommitOutcome:
+    """Revalidate and write the record — the FSM's only writer.
+
+    Handlers hold the chat lock, so begin → Todoist API → commit runs
+    sequentially per chat; the revalidation here is defense in depth
+    anyway (a phase flip between begin and commit writes nothing).
+    user_id mirrors begin for a symmetric handler call shape; the
+    validation itself needs no caller identity.  Returns the lists to
+    re-edit.
+    """
+    tasks = get_tasks(chat_data)
+    item = tasks.get(task_id)
+    assert item is not None, f"task {task_id} missing from the chat's map"
+    reason = reject_reason(tasks, task_id, event)
+    if reason is not None:
+        return Rejected(reason=reason, task_id=task_id)
+    tasks[task_id] = apply_event(item, event)
+    return Applied(touched=lists_displaying(chat_data, today, task_id))
 
 
 def take_mine(

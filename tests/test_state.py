@@ -5,10 +5,24 @@ from datetime import date, timedelta
 import pytest
 
 from iwcb_bot.state import (
+    Ambiguous,
+    Applied,
+    Assign,
+    Complete,
+    Edit,
+    Event,
+    Permitted,
+    Rejected,
+    Reopen,
+    Reschedule,
     Task,
     TaskList,
+    Unresolved,
     active_lists,
+    apply_event,
     assignee_name_candidates,
+    begin,
+    commit,
     displayed_matches,
     get_chat_list,
     get_mine_lists,
@@ -18,12 +32,14 @@ from iwcb_bot.state import (
     prune_mine_lists,
     prune_tasks,
     put_tasks,
+    reject_reason,
     resolve_ids,
     resolve_one,
     resolve_query,
     set_chat_list,
     set_mine_list,
     take_mine,
+    task_phase,
     task_suffixes,
     todoist_name_for_user,
     union_ids,
@@ -609,3 +625,178 @@ class TestResolveOne:
         chat = _tasklist(ids=["pp11"])
         mine = _tasklist(ids=["qq11", "r11"])
         assert resolve_one([chat, mine], "11") == ("ok", ["pp11"])
+
+
+class TestTaskPhase:
+    def test_missing_is_active_by_invariant(self) -> None:
+        assert task_phase({}, "ab") == "active"
+
+    def test_flag_maps_to_phase(self) -> None:
+        assert task_phase({"ab": _task("ab")}, "ab") == "active"
+        assert task_phase({"ab": _task("ab", done=True)}, "ab") == "completed"
+
+
+class TestRejectReason:
+    def test_complete_active_permitted_completed_rejected(self) -> None:
+        assert reject_reason({"ab": _task("ab")}, "ab", Complete()) is None
+        done = {"ab": _task("ab", done=True)}
+        assert reject_reason(done, "ab", Complete()) == "already_completed"
+
+    def test_reopen_active_rejected_completed_permitted(self) -> None:
+        active = {"ab": _task("ab")}
+        assert reject_reason(active, "ab", Reopen()) == "not_completed"
+        done = {"ab": _task("ab", done=True)}
+        assert reject_reason(done, "ab", Reopen()) is None
+
+    def test_reopen_recurring_record_rejected(self) -> None:
+        active = {"ab": _task("ab", recurring=True)}
+        assert reject_reason(active, "ab", Reopen()) == "recurring"
+        done = {"ab": _task("ab", done=True, recurring=True)}
+        assert reject_reason(done, "ab", Reopen()) == "recurring"
+
+    def test_modify_completed_rejected_active_permitted(self) -> None:
+        events: list[Event] = [
+            Edit(text="x"),
+            Assign(assignee="Priya Singh"),
+            Reschedule(due=None, recurring=False),
+        ]
+        active = {"ab": _task("ab")}
+        done = {"ab": _task("ab", done=True)}
+        for event in events:
+            assert reject_reason(active, "ab", event) is None
+            assert reject_reason(done, "ab", event) == "already_completed"
+
+
+class TestApplyEvent:
+    def test_complete_unset_keeps_due(self) -> None:
+        out = apply_event(_task("ab", due=TODAY), Complete())
+        assert out.done is True
+        assert out.due == TODAY
+
+    def test_complete_date_sets_due_and_strikes(self) -> None:
+        rolled = TODAY + timedelta(days=1)
+        out = apply_event(_task("ab", due=TODAY), Complete(due=rolled))
+        assert out.done is True
+        assert out.due == rolled
+
+    def test_reopen_unstrikes_keeps_fields(self) -> None:
+        item = _task("ab", text="milk", due=TODAY, done=True, assignee="Priya")
+        out = apply_event(item, Reopen())
+        assert out == _task("ab", text="milk", due=TODAY, done=False, assignee="Priya")
+
+    def test_edit_replaces_text_only(self) -> None:
+        out = apply_event(_task("ab", text="old", due=TODAY), Edit(text="new"))
+        assert out == _task("ab", text="new", due=TODAY)
+
+    def test_assign_sets_assignee(self) -> None:
+        out = apply_event(_task("ab"), Assign(assignee="Priya Singh"))
+        assert out.assignee == "Priya Singh"
+
+    def test_reschedule_sets_due_and_recurring(self) -> None:
+        later = TODAY + timedelta(days=3)
+        out = apply_event(_task("ab", due=TODAY), Reschedule(due=later, recurring=True))
+        assert out.due == later
+        assert out.recurring is True
+
+    def test_reschedule_none_clears_due(self) -> None:
+        out = apply_event(_task("ab"), Reschedule(due=None, recurring=False))
+        assert out.due is None
+
+
+class TestBegin:
+    def test_unresolved_reports_list_count(self) -> None:
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[_task("ab")])
+        assert begin(data, 1, TODAY, "zz", Edit(text="x")) == Unresolved(list_count=1)
+
+    def test_ambiguous_reports_count(self) -> None:
+        data = _chat_data(
+            chat=_tasklist(["abx", "cbx"]), tasks=[_task("abx"), _task("cbx")]
+        )
+        assert begin(data, 1, TODAY, "bx", Edit(text="x")) == Ambiguous(count=2)
+
+    def test_permitted_returns_task_and_entity(self) -> None:
+        milk = _task("ab", text="milk")
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[milk])
+        assert begin(data, 1, TODAY, "ab", Edit(text="x")) == Permitted(
+            task_id="ab", item=milk
+        )
+
+    def test_rejected_carries_reason_and_task_id(self) -> None:
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[_task("ab", done=True)])
+        assert begin(data, 1, TODAY, "ab", Complete()) == Rejected(
+            reason="already_completed", task_id="ab"
+        )
+
+    def test_stale_mine_pruned_before_resolving(self) -> None:
+        data = _chat_data(
+            mine={1: _tasklist(["cd"], day=TODAY - timedelta(days=1))},
+            tasks=[_task("cd")],
+        )
+        assert begin(data, 1, TODAY, "cd", Edit(text="x")) == Unresolved(list_count=0)
+        assert get_mine_lists(data) == {}
+        assert get_tasks(data) == {}  # prune_tasks ran with the stale list gone
+
+    def test_writes_nothing(self) -> None:
+        chat = _tasklist(["ab"])
+        mine = {2: _tasklist(["ab"])}
+        entity = _task("ab")
+        data = _chat_data(chat=chat, mine=mine, tasks=[entity])
+        assert begin(data, 1, TODAY, "ab", Complete()) == Permitted(
+            task_id="ab", item=entity
+        )
+        assert get_chat_list(data) is chat
+        assert get_mine_lists(data) == mine
+        assert get_tasks(data) == {"ab": entity}
+
+
+class TestCommit:
+    def test_single_map_write_strikes_record(self) -> None:
+        chat = _tasklist(["ab"])
+        data = _chat_data(chat=chat, tasks=[_task("ab")])
+        outcome = commit(data, 1, TODAY, "ab", Complete())
+        assert outcome == Applied(touched=[chat])
+        assert get_tasks(data)["ab"].done is True
+
+    def test_complete_unset_keeps_due(self) -> None:
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[_task("ab", due=TODAY)])
+        commit(data, 1, TODAY, "ab", Complete())
+        item = get_tasks(data)["ab"]
+        assert item.done is True
+        assert item.due == TODAY
+
+    def test_reopen_clears_record(self) -> None:
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[_task("ab", done=True)])
+        outcome = commit(data, 1, TODAY, "ab", Reopen())
+        assert isinstance(outcome, Applied)
+        assert get_tasks(data)["ab"].done is False
+
+    def test_reschedule_none_clears_due(self) -> None:
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[_task("ab", due=TODAY)])
+        commit(data, 1, TODAY, "ab", Reschedule(due=None, recurring=False))
+        assert get_tasks(data)["ab"].due is None
+
+    def test_edit_rejected_when_completed_in_between(self) -> None:
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[_task("ab", text="old")])
+        first = commit(data, 1, TODAY, "ab", Complete())
+        assert isinstance(first, Applied)
+        second = commit(data, 1, TODAY, "ab", Edit(text="new"))
+        assert second == Rejected(reason="already_completed", task_id="ab")
+        item = get_tasks(data)["ab"]
+        assert item.text == "old"  # rejection wrote nothing
+        assert item.done is True
+
+    def test_commit_touched_includes_other_users_mine(self) -> None:
+        chat = _tasklist(["ab"])
+        mine2 = _tasklist(["ab"])
+        mine3 = _tasklist(["ab"])
+        data = _chat_data(chat=chat, mine={2: mine2, 3: mine3}, tasks=[_task("ab")])
+        outcome = commit(data, 1, TODAY, "ab", Complete())
+        assert outcome == Applied(touched=[chat, mine2, mine3])
+
+    def test_replaces_entity_not_mutates(self) -> None:
+        original = _task("ab", text="old")
+        data = _chat_data(chat=_tasklist(["ab"]), tasks=[original])
+        commit(data, 1, TODAY, "ab", Edit(text="new"))
+        stored = get_tasks(data)["ab"]
+        assert stored is not original
+        assert original.text == "old"
