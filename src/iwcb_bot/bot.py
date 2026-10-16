@@ -890,79 +890,124 @@ def build_application(
 
         return wrapper
 
-    async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await _reply(update, _HELP.format(project=project.name))
+    class _Command:
+        """Uniform shell for command handlers: guards, optional chat
+        lock, and registration.  Subclasses implement run(); the
+        ClassVars below pick the preamble:
 
-    async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat = update.effective_chat
-        if chat is None:
-            return
-        text = " ".join(context.args or []).strip()
-        if not text:
-            await _respond(
-                update,
-                "soft",
-                "Usage: /add <task text> — e.g. /add buy milk tomorrow p1",
-            )
-            return
-        if len(text) > 500:
-            await _respond(update, "soft", "Task text too long — max 500 characters")
-            return
-        async with _chat_lock(chat.id):
-            task = await todoist.add_task_in_project(text, project)
-            today = cfg.today()
-            day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
-            detail = f" (due {_fmt_due(day, today)})" if day is not None else ""
-            headline = f"✅ Added: {_render_text(task.content)}{detail}"
-            task_list = get_chat_list(context.chat_data)
-            if task_list is not None and task_list.day != today:
-                task_list = None
-            cutoff = task_list.cutoff if task_list is not None else today
-            if day is None or day > cutoff:
-                await _respond(update, "ok", headline, html=True)
-                return
-            try:
-                tasks = await todoist.tasks_due_by(project.id, cutoff)
-            except TodoistError:
-                # The add itself succeeded — report it; only the list
-                # refresh failed.
-                await _respond(
-                    update,
-                    "ok",
-                    f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}",
-                    html=True,
-                )
-                return
-            # "Will react", not "did react": if Telegram then rejects
-            # the reaction the headline echo stays suppressed too —
-            # zero status is the mandated no-fallback contract.
-            confirmed = _should_react(update)
-            await _send_list(
-                update,
-                context,
-                tasks,
-                today,
-                cutoff,
-                mentions,
-                todoist,
-                project.id,
-                headline=headline,
-                already_confirmed=confirmed,
-            )
-            if confirmed:
-                # The list above is content and still goes out; the
-                # reaction is the action's status line.
-                await _react(update, "ok")
+        - require_message / require_user: early-return unless present
+        - use_lock: wrap run() in the per-chat lock (commands that
+          need checks outside the lock set this False and take it
+          themselves inside run)
+        - typing: passed to guarded()
 
-    def _cmd_list(days: int, name: str) -> Handler:
+        run() receives the raw update/context; derive chat/user inside
+        as needed.  Keep run bodies a linear sequence of awaits on the
+        closed-over helpers (cfg, todoist, _respond, ...) so they can
+        later be reified as effect descriptions for a pure
+        interpreter — this base holds no effects of its own.
+
+        Defined inside build_application; subclasses close over cfg,
+        todoist, project, mentions and the _respond/_send helpers.
+        """
+
+        log_name: str
+        require_message: ClassVar[bool] = False
+        require_user: ClassVar[bool] = False
+        use_lock: ClassVar[bool] = True
+        typing: ClassVar[bool] = True
+
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            raise NotImplementedError
+
+    def _command_handler(command: _Command) -> Handler:
+        """Guarded PTB handler for a _Command instance."""
+
         async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if command.require_message and update.effective_message is None:
+                return
+            if command.require_user and update.effective_user is None:
+                return
+            chat = update.effective_chat
+            if command.use_lock:
+                if chat is None:
+                    return
+                async with _chat_lock(chat.id):
+                    await command.run(update, context)
+            else:
+                await command.run(update, context)
+
+        cmd.__name__ = command.log_name
+        return guarded(cmd, typing=command.typing)
+
+    class HelpCommand(_Command):
+        """The /help and /start reply — no lock, no typing indicator."""
+
+        log_name = "cmd_help"
+        require_message = True
+        use_lock = False
+        typing = False
+
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            await _reply(update, _HELP.format(project=project.name))
+
+    class AddCommand(_Command):
+        """Quick-add: validates, then locks, adds, and confirms.
+
+        use_lock is False so the usage/too-long replies happen outside
+        the chat lock, as they always have.
+        """
+
+        log_name = "cmd_add"
+        require_message = False
+        use_lock = False
+
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat = update.effective_chat
             if chat is None:
                 return
+            text = " ".join(context.args or []).strip()
+            if not text:
+                await _respond(
+                    update,
+                    "soft",
+                    "Usage: /add <task text> — e.g. /add buy milk tomorrow p1",
+                )
+                return
+            if len(text) > 500:
+                await _respond(
+                    update, "soft", "Task text too long — max 500 characters"
+                )
+                return
             async with _chat_lock(chat.id):
+                task = await todoist.add_task_in_project(text, project)
                 today = cfg.today()
-                cutoff = today + timedelta(days=days)
-                tasks = await todoist.tasks_due_by(project.id, cutoff)
+                day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
+                detail = f" (due {_fmt_due(day, today)})" if day is not None else ""
+                headline = f"✅ Added: {_render_text(task.content)}{detail}"
+                task_list = get_chat_list(context.chat_data)
+                if task_list is not None and task_list.day != today:
+                    task_list = None
+                cutoff = task_list.cutoff if task_list is not None else today
+                if day is None or day > cutoff:
+                    await _respond(update, "ok", headline, html=True)
+                    return
+                try:
+                    tasks = await todoist.tasks_due_by(project.id, cutoff)
+                except TodoistError:
+                    # The add itself succeeded — report it; only the list
+                    # refresh failed.
+                    await _respond(
+                        update,
+                        "ok",
+                        f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}",
+                        html=True,
+                    )
+                    return
+                # "Will react", not "did react": if Telegram then rejects
+                # the reaction the headline echo stays suppressed too —
+                # zero status is the mandated no-fallback contract.
+                confirmed = _should_react(update)
                 await _send_list(
                     update,
                     context,
@@ -972,10 +1017,35 @@ def build_application(
                     mentions,
                     todoist,
                     project.id,
+                    headline=headline,
+                    already_confirmed=confirmed,
                 )
+                if confirmed:
+                    # The list above is content and still goes out; the
+                    # reaction is the action's status line.
+                    await _react(update, "ok")
 
-        cmd.__name__ = name
-        return guarded(cmd, typing=True)
+    class ListCommand(_Command):
+        """One of /today, /tomorrow, /week — fetch and show a list."""
+
+        def __init__(self, days: int, name: str) -> None:
+            self.days = days
+            self.log_name = name
+
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            today = cfg.today()
+            cutoff = today + timedelta(days=self.days)
+            tasks = await todoist.tasks_due_by(project.id, cutoff)
+            await _send_list(
+                update,
+                context,
+                tasks,
+                today,
+                cutoff,
+                mentions,
+                todoist,
+                project.id,
+            )
 
     async def _require_lists(
         update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
@@ -1002,25 +1072,29 @@ def build_application(
             await _respond(update, "soft", f"Send {_LIST_CMDS} or /mine first")
         return None
 
-    class _ListAction:
+    class _ListAction(_Command):
         """A list-mutating command backed by the begin/commit FSM.
 
-        _run_action owns the shared shell — arg split, chat lock,
-        require lists, begin, perform, commit, list re-edit, ok reply
-        — so a subclass supplies only its distinct pieces: usage text,
-        the begin event, the rejected reply, and the perform()
-        mutation.          The optional hooks (split, validate,
+        run() owns the shared FSM shell — arg split, chat lock, require
+        lists, begin, perform, commit, list re-edit, ok reply — so a
+        subclass supplies only its distinct pieces: usage text, the
+        begin event, the rejected reply, and the perform() mutation.
+        The optional hooks (split, validate,
         rejected_debug, applied_verb, log_applied) have working
-        defaults; add a new command by subclassing here — set log_name,
-        implement usage/begin_event/rejected_reply/perform — and
-        registering _action_handler(MyCommand()).
+        defaults; add a mutating command by subclassing here — set
+        log_name, implement usage/begin_event/rejected_reply/perform —
+        and registering _command_handler(MyCommand()).
+
+        use_lock is False on purpose: the shell takes the chat lock
+        itself, after the pre-lock split/validate replies.
 
         Defined inside build_application so methods close over cfg,
         todoist, project, mentions and the _respond/_edit_lists
         helpers.
         """
 
-        log_name: ClassVar[str]
+        require_user = True
+        use_lock = False
 
         def usage(self) -> str:
             raise NotImplementedError
@@ -1070,80 +1144,71 @@ def build_application(
                 len(applied.touched),
             )
 
-    async def _run_action(
-        command: _ListAction, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        """Shared shell for _ListAction commands — see the class doc."""
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat is None or user is None:
-            return
-        parts = command.split(" ".join(context.args or []).strip())
-        if parts is None:
-            await _respond(update, "soft", command.usage())
-            return
-        query, rest = parts
-        too_long = command.validate(rest)
-        if too_long is not None:
-            await _respond(update, "soft", too_long)
-            return
-        async with _chat_lock(chat.id):
-            if await _require_lists(update, context, user.id) is None:
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Shared shell for _ListAction commands — see the class doc."""
+            chat = update.effective_chat
+            user = update.effective_user
+            if chat is None or user is None:
                 return
-            outcome = begin(
-                context.chat_data,
-                user.id,
-                cfg.today(),
-                query.casefold(),
-                command.begin_event(rest),
-            )
-            match outcome:
-                case Unresolved() | Ambiguous() as fail:
-                    await _reply_begin_failure(update, fail, command.log_name)
+            parts = self.split(" ".join(context.args or []).strip())
+            if parts is None:
+                await _respond(update, "soft", self.usage())
+                return
+            query, rest = parts
+            too_long = self.validate(rest)
+            if too_long is not None:
+                await _respond(update, "soft", too_long)
+                return
+            async with _chat_lock(chat.id):
+                if await _require_lists(update, context, user.id) is None:
                     return
-                case Rejected() as rej:
-                    debug = command.rejected_debug(rej)
-                    if debug is not None:
-                        logger.debug(
-                            "%s task=%s: %s", command.log_name, rej.task_id, debug
-                        )
-                    await _respond(update, "soft", command.rejected_reply(rej))
-                    return
-                case Permitted() as ok:
-                    pass
-            try:
-                result = await command.perform(update, ok, rest)
-            except TodoistError as exc:
-                await _respond(
-                    update,
-                    "hard",
-                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
+                outcome = begin(
+                    context.chat_data,
+                    user.id,
+                    cfg.today(),
+                    query.casefold(),
+                    self.begin_event(rest),
                 )
-                return
-            if result is None:
-                return
-            applied = commit(
-                context.chat_data, user.id, cfg.today(), ok.task_id, result.event
-            )
-            # Unreachable in practice: sequential updates under the
-            # chat lock keep the phase stable between begin and commit.
-            assert isinstance(applied, Applied)
-            command.log_applied(ok, applied, result)
-            await _edit_lists(
-                update,
-                context,
-                applied.touched,
-                mentions,
-                get_tasks(context.chat_data),
-            )
-            await _respond(update, "ok", result.success, html=True)
-
-    def _action_handler(command: _ListAction) -> Handler:
-        async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            await _run_action(command, update, context)
-
-        cmd.__name__ = command.log_name
-        return guarded(cmd, typing=True)
+                match outcome:
+                    case Unresolved() | Ambiguous() as fail:
+                        await _reply_begin_failure(update, fail, self.log_name)
+                        return
+                    case Rejected() as rej:
+                        debug = self.rejected_debug(rej)
+                        if debug is not None:
+                            logger.debug(
+                                "%s task=%s: %s", self.log_name, rej.task_id, debug
+                            )
+                        await _respond(update, "soft", self.rejected_reply(rej))
+                        return
+                    case Permitted() as ok:
+                        pass
+                try:
+                    result = await self.perform(update, ok, rest)
+                except TodoistError as exc:
+                    await _respond(
+                        update,
+                        "hard",
+                        f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
+                    )
+                    return
+                if result is None:
+                    return
+                applied = commit(
+                    context.chat_data, user.id, cfg.today(), ok.task_id, result.event
+                )
+                # Unreachable in practice: sequential updates under the
+                # chat lock keep the phase stable between begin and commit.
+                assert isinstance(applied, Applied)
+                self.log_applied(ok, applied, result)
+                await _edit_lists(
+                    update,
+                    context,
+                    applied.touched,
+                    mentions,
+                    get_tasks(context.chat_data),
+                )
+                await _respond(update, "ok", result.success, html=True)
 
     class DoneCommand(_ListAction):
         log_name = "cmd_done"
@@ -1397,14 +1462,19 @@ def build_application(
             # cmd_due has no post-commit line.
             pass
 
-    async def cmd_mine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    class MineCommand(_Command):
         """The sender's own tasks: due, then upcoming, then undated."""
-        chat = update.effective_chat
-        user = update.effective_user
-        message = update.effective_message
-        if chat is None or user is None or message is None:
-            return
-        async with _chat_lock(chat.id):
+
+        log_name = "cmd_mine"
+        require_message = True
+        require_user = True
+
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            chat = update.effective_chat
+            user = update.effective_user
+            message = update.effective_message
+            if chat is None or user is None or message is None:
+                return
             assignee_name = todoist_name_for_user(
                 user.id, user.username, cfg.assignee_mentions
             )
@@ -1479,26 +1549,42 @@ def build_application(
                 ),
             )
 
-    async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        if message is None:
-            return
-        await message.reply_text(
-            f'📂 <a href="{html.escape(project.url, quote=True)}">'
-            f"{html.escape(project.name)}</a> — open in Todoist",
-            parse_mode=ParseMode.HTML,
-        )
+    class ProjectCommand(_Command):
+        """A link to the configured project — no lock, no typing."""
 
-    async def on_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        message = update.effective_message
-        text = message.text if message is not None else None
-        first = (text or "").split(maxsplit=1)[0] if text else ""
-        if "@" in first:
-            # /cmd@SomeOtherBot — another bot's command, stay quiet.
-            addressed = first.partition("@")[2].casefold()
-            if addressed != context.bot.username.casefold():
+        log_name = "cmd_project"
+        require_message = True
+        use_lock = False
+        typing = False
+
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            message = update.effective_message
+            if message is None:
                 return
-        await _respond(update, "soft", "Unknown command — try /help")
+            await message.reply_text(
+                f'📂 <a href="{html.escape(project.url, quote=True)}">'
+                f"{html.escape(project.name)}</a> — open in Todoist",
+                parse_mode=ParseMode.HTML,
+            )
+
+    class UnknownCommand(_Command):
+        """Soft 'unknown command' for anything unmatched — no lock."""
+
+        log_name = "on_unknown"
+        require_message = True
+        use_lock = False
+        typing = False
+
+        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            message = update.effective_message
+            text = message.text if message is not None else None
+            first = (text or "").split(maxsplit=1)[0] if text else ""
+            if "@" in first:
+                # /cmd@SomeOtherBot — another bot's command, stay quiet.
+                addressed = first.partition("@")[2].casefold()
+                if addressed != context.bot.username.casefold():
+                    return
+            await _respond(update, "soft", "Unknown command — try /help")
 
     morning_task: asyncio.Task[None] | None = None
 
@@ -1546,41 +1632,49 @@ def build_application(
         .build()
     )
     application.add_handler(
-        CommandHandler(["help", "start"], guarded(cmd_help), filters=auth)
+        CommandHandler(["help", "start"], _command_handler(HelpCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("add", guarded(cmd_add, typing=True), filters=auth)
+        CommandHandler("add", _command_handler(AddCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("today", _cmd_list(0, "cmd_today"), filters=auth)
+        CommandHandler(
+            "today", _command_handler(ListCommand(0, "cmd_today")), filters=auth
+        )
     )
     application.add_handler(
-        CommandHandler("tomorrow", _cmd_list(1, "cmd_tomorrow"), filters=auth)
+        CommandHandler(
+            "tomorrow", _command_handler(ListCommand(1, "cmd_tomorrow")), filters=auth
+        )
     )
     application.add_handler(
-        CommandHandler("week", _cmd_list(6, "cmd_week"), filters=auth)
+        CommandHandler(
+            "week", _command_handler(ListCommand(6, "cmd_week")), filters=auth
+        )
     )
     application.add_handler(
-        CommandHandler("mine", guarded(cmd_mine, typing=True), filters=auth)
+        CommandHandler("mine", _command_handler(MineCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("done", _action_handler(DoneCommand()), filters=auth)
+        CommandHandler("done", _command_handler(DoneCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("undo", _action_handler(UndoCommand()), filters=auth)
+        CommandHandler("undo", _command_handler(UndoCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("edit", _action_handler(EditCommand()), filters=auth)
+        CommandHandler("edit", _command_handler(EditCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("assign", _action_handler(AssignCommand()), filters=auth)
+        CommandHandler("assign", _command_handler(AssignCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("due", _action_handler(DueCommand()), filters=auth)
+        CommandHandler("due", _command_handler(DueCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("project", guarded(cmd_project), filters=auth)
+        CommandHandler("project", _command_handler(ProjectCommand()), filters=auth)
     )
-    application.add_handler(MessageHandler(filters.COMMAND & auth, guarded(on_unknown)))
+    application.add_handler(
+        MessageHandler(filters.COMMAND & auth, _command_handler(UnknownCommand()))
+    )
     application.add_error_handler(on_error)
     return application
