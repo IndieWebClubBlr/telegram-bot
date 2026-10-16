@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from telegram.constants import ChatType, ReactionEmoji
 from todoist_api_python.models import Deadline, Due
 
 from iwcb_bot.bot import (
@@ -17,9 +18,12 @@ from iwcb_bot.bot import (
     _NBSP,
     _next_announce,
     _one_line,
+    _reaction_mode_applies,
     _render_list,
     _render_list_message,
     _render_text,
+    _status_emoji,
+    Status,
 )
 from iwcb_bot.config import Config
 from iwcb_bot.state import Task
@@ -575,6 +579,29 @@ class TestIsGroupChatType:
         assert _is_group_chat_type("") is False
 
 
+class TestReactionModeApplies:
+    @pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+    def test_flag_on_in_group_reacts(self, chat_type: str) -> None:
+        assert _reaction_mode_applies(True, chat_type) is True
+
+    @pytest.mark.parametrize("chat_type", ["private", "channel", ""])
+    def test_flag_on_outside_group_texts(self, chat_type: str) -> None:
+        assert _reaction_mode_applies(True, chat_type) is False
+
+    def test_unresolvable_chat_type_texts(self) -> None:
+        assert _reaction_mode_applies(True, None) is False
+
+    @pytest.mark.parametrize("chat_type", ["group", "supergroup", "private", None])
+    def test_flag_off_never_reacts(self, chat_type: str | None) -> None:
+        assert _reaction_mode_applies(False, chat_type) is False
+
+    def test_accepts_chat_type_str_enum(self) -> None:
+        # Chat.type arrives as ChatType (a str-enum), not a bare str —
+        # no .value unwrapping at the call site.
+        assert _reaction_mode_applies(True, ChatType.GROUP) is True
+        assert _reaction_mode_applies(True, ChatType.PRIVATE) is False
+
+
 class TestRenderListMessage:
     ITEM = Task(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
     TASKS = {ITEM.task_id: ITEM}
@@ -622,3 +649,19 @@ class TestRenderListMessage:
         # a miss is a bug — never a silently skipped line.
         with pytest.raises(AssertionError, match="no entity in the map"):
             _render_list_message(["zz"], {}, TODAY, mentions={}, show_dates=False)
+
+
+class TestStatusEmoji:
+    @pytest.mark.parametrize(
+        ("status", "emoji"),
+        [("ok", "👍"), ("soft", "🤨"), ("hard", "👎")],
+    )
+    def test_status_maps_to_emoji(self, status: Status, emoji: str) -> None:
+        assert _status_emoji(status) == emoji
+
+    def test_all_statuses_are_valid_reaction_emoji(self) -> None:
+        # Telegram's reaction API rejects emoji outside its fixed set —
+        # a typo'd mapping would silently drop every status line.
+        valid = {entry.value for entry in ReactionEmoji}
+        mapped = {_status_emoji("ok"), _status_emoji("soft"), _status_emoji("hard")}
+        assert mapped <= valid

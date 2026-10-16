@@ -20,6 +20,7 @@ let
       ALLOWED_CHAT_IDS=${lib.concatMapStringsSep "," toString cfg.allowedChatIds}
       MORNING_ANNOUNCE_TIME=${cfg.morningAnnounceTime}
       MORNING_ANNOUNCE_WHEN_EMPTY=${lib.boolToString cfg.morningAnnounceWhenEmpty}
+      REACTION_REPLIES=${lib.boolToString cfg.reactionReplies}
       LOG_LEVEL=${cfg.logLevel}
     ''
     + lib.optionalString (cfg.timeZone != null) "TIMEZONE=${cfg.timeZone}\n"
@@ -101,6 +102,20 @@ in
         title over "Nothing due today"; false stays silent and clears
         the chat's stored list so the previous day's message stops
         updating.
+      '';
+    };
+
+    reactionReplies = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether action commands answer with a reaction on the command
+        message instead of a text reply (REACTION_REPLIES). true (the
+        non-default) reacts in group chats — 👍 success, 🤨 soft
+        refusal, 👎 failure — with no text fallback; private chats
+        always keep text replies and list commands still send their
+        messages. false (the default) keeps the historical text
+        replies.
       '';
     };
 

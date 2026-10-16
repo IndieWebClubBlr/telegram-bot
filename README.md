@@ -12,7 +12,7 @@ All commands operate on the configured project only.
 | Command | What it does |
 | --- | --- |
 | `/help` (alias `/start`) | Command list |
-| `/add <text>` | Add a task using Todoist [quick-add syntax](https://developer.todoist.com/api/v1/#operation/quick_add_api_v1_tasks_quick_post): `/add buy milk tomorrow p1 @errand /Groceries +Abhinav`. Sections (`/Name`) and assignees (`+Name`) work because the configured project is auto-prepended to the quick-add text; a `#OtherProject` in the text is overridden — the configured project always wins. If the new task falls within the last shown list's window (today, when no list has been shown yet), the reply also contains that list refreshed — IDs shown earlier may have shifted; if that refresh fails, the confirmation still arrives with a note |
+| `/add <text>` | Add a task using Todoist [quick-add syntax](https://developer.todoist.com/api/v1/#operation/quick_add_api_v1_tasks_quick_post): `/add buy milk tomorrow p1 @errand /Groceries +Abhinav`. Sections (`/Name`) and assignees (`+Name`) work because the configured project is auto-prepended to the quick-add text; a `#OtherProject` in the text is overridden — the configured project always wins. If the new task falls within the last shown list's window (today, when no list has been shown yet), the reply also contains that list refreshed — IDs shown earlier may have shifted; if that refresh fails, the confirmation still arrives with a note (under `REACTION_REPLIES=true` it cannot — see that row) |
 | `/today` | Tasks in the project due today or overdue (⚠), sorted by due date; deadlines count as due dates (the earlier of the two wins when a task has both). Each line starts with a short unique ID shown as `[id]` in lowercase; overdue lines also end with `— due <date>`, with the year appended when it differs from the current one |
 | `/tomorrow` | Everything `/today` shows plus tasks due tomorrow; header `Due by <tomorrow>:`, every line carries its due date |
 | `/week` | Cumulative through end of today + 6 days (7 calendar days including today); header `Due by <date>:`, every line carries its due date |
@@ -27,7 +27,8 @@ All commands operate on the configured project only.
 Only chats listed in `ALLOWED_CHAT_IDS` are served; everyone else is ignored.
 Any member of an allowed chat can use the commands (the filter is per chat,
 not per user). Commands only act on new messages — editing an old message
-does not re-run it. Unknown commands get a short reply pointing at `/help`;
+does not re-run it. Unknown commands get a short reply pointing at `/help`
+(or a 🤨 reaction under `REACTION_REPLIES=true`);
 commands addressed to other bots (`/cmd@OtherBot`) are ignored.
 
 Task text is markdown (that's how Todoist stores it): links, **bold**,
@@ -49,7 +50,7 @@ refuses them instead of reporting a false success; bring the occurrence back
 by rescheduling in Todoist.
 
 While a command is talking to Todoist (`/add`, `/today`, `/tomorrow`, `/week`,
-`/mine`, `/done`, `/undo`, `/edit`, `/assign`, `/due`), Telegram shows the bot typing until the reply arrives.
+`/mine`, `/done`, `/undo`, `/edit`, `/assign`, `/due`), Telegram shows the bot typing until the reply (or `REACTION_REPLIES` reaction) arrives.
 
 ## Daily morning list
 
@@ -83,6 +84,7 @@ errors) — plus a few optional ones:
 | `TIMEZONE` | Optional IANA time zone for the bot's "today" calculations (e.g. `Asia/Kolkata`). The server and the bot's users are often in different time zones, so set this explicitly; an invalid value aborts startup with exit code 2. Falls back to the server's local time zone — but only its offset at startup, so on a DST-observing server the morning reminder drifts by an hour after a transition until restart; set `TIMEZONE` to avoid this. Naive due datetimes (the normal Todoist shape) are taken as wall-clock times in this zone; timezone-aware dues are converted into it before the calendar day is taken |
 | `MORNING_ANNOUNCE_TIME` | Optional wall-clock time (24h `HH:MM`, in the `TIMEZONE` zone) at which the bot proactively sends the day's task list to every allowed group chat (private chats are skipped). Defaults to `09:00`; set to `off` to disable. An invalid value aborts startup with exit code 2 |
 | `MORNING_ANNOUNCE_WHEN_EMPTY` | `true` (default) or `false` — whether the daily list is sent when nothing is due. `true` posts the title over "Nothing due today 🎉"; `false` stays silent and clears the chat's stored list so the previous day's message stops updating. Case-insensitive; an invalid value aborts startup with exit code 2 |
+| `REACTION_REPLIES` | `false` (default) or `true` — in group chats, action-command feedback (`/add`, `/done`, `/undo`, `/edit`, `/assign`, `/due`, unknown-command hints and `/mine`'s configuration hints) becomes a reaction on the command message instead of a text reply: 👍 success, 🤨 soft refusal (usage error, no match, already completed), 👎 failure (Todoist/API errors). One reaction per command, so an `/add` whose list refresh fails still gets only 👍 — the stale-list note has no channel in this mode. List messages (`/today`, `/tomorrow`, `/week`, `/mine`, `/help`, `/project`) are always sent as text, private chats always keep text replies, and a rejected reaction logs at `DEBUG` and stays silent — no text fallback. Case-insensitive; an invalid value aborts startup with exit code 2 |
 | `ASSIGNEE_MENTIONS` | Optional `;`-separated `Todoist Name=Telegram` pairs mapping shared-project assignee names to Telegram mentions — `Abhinav Nair=@abnv;Priya Singh=123456789`. Names match case-insensitively; mapped names render as clickable mentions, unmapped assignees as plain text, unassigned tasks show no suffix. Names and targets must each be unique (compared case-insensitively) — a duplicate aborts startup with exit code 2 |
 | `LOG_LEVEL` | Optional bot log level: `DEBUG`, `INFO`, `WARNING` or `ERROR` (case-insensitive). Defaults to `INFO`. `DEBUG` logs each command action and Todoist API call with durations, and includes numeric chat/user/task ids for correlation — it never logs names, usernames, chat titles, task text or command arguments. An invalid value aborts startup with exit code 2 |
 

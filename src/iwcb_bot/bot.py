@@ -8,10 +8,10 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from datetime import date, datetime, time, timedelta, tzinfo
-from typing import Any
+from typing import Any, Literal
 
 from markdown_it import MarkdownIt
-from telegram import Message, Update
+from telegram import Message, ReactionTypeEmoji, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
@@ -131,49 +131,6 @@ Commands (project: {project}):
 """.replace("{list_cmds}", _LIST_CMDS)
 
 
-def guarded(handler: Handler, *, typing: bool = False) -> Handler:
-    @functools.wraps(handler)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        started = asyncio.get_running_loop().time()
-        chat = update.effective_chat
-        user = update.effective_user
-        # Ids only — never usernames, chat titles, message text or
-        # command arguments.
-        logger.debug(
-            "%s chat=%s user=%s",
-            handler.__name__,
-            chat.id if chat else None,
-            user.id if user else None,
-        )
-        ticker: asyncio.Task[None] | None = None
-        try:
-            if typing:
-                ticker = await _start_typing(update, context)
-            await handler(update, context)
-            logger.debug(
-                "%s done in %.0fms",
-                handler.__name__,
-                (asyncio.get_running_loop().time() - started) * 1000,
-            )
-        except TodoistError as exc:
-            logger.warning("%s failed: %s", handler.__name__, exc)
-            await _reply_safely(update, f"⚠ {exc}")
-        except TelegramError:
-            logger.exception("Telegram error in %s", handler.__name__)
-            await _reply_safely(
-                update,
-                f"⚠ Telegram send failed — the command may have "
-                f"completed; check with {_LIST_CMDS} or /mine",
-            )
-        except Exception:
-            logger.exception("Unhandled error in %s", handler.__name__)
-            await _reply_safely(update, "Unexpected error")
-        finally:
-            await _stop_typing(ticker)
-
-    return wrapper
-
-
 async def _start_typing(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> asyncio.Task[None] | None:
@@ -225,34 +182,41 @@ async def _reply(update: Update, text: str) -> None:
         await message.reply_text(text)
 
 
-async def _reply_safely(update: Update, text: str = "Unexpected error") -> None:
+Status = Literal["ok", "soft", "hard"]
+
+_STATUS_EMOJI: dict[Status, str] = {"ok": "👍", "soft": "🤨", "hard": "👎"}
+
+
+def _status_emoji(status: Status) -> str:
+    """Reaction emoji for a response status — from Telegram's fixed
+    reaction set (REACTION_REPLIES): 👍 ok, 🤨 soft refusal, 👎 failure.
+    """
+    return _STATUS_EMOJI[status]
+
+
+async def _react(update: Update, status: Status) -> None:
+    """React on the command message; failures log and stay silent.
+
+    Reaction mode's contract (REACTION_REPLIES): no text fallback —
+    a chat that rejects the reaction gets no feedback at all.
+    """
+    message = update.effective_message
+    if message is None:
+        return
     try:
-        await _reply(update, text)
-    except TelegramError:
-        logger.exception("could not send reply")
+        await message.get_bot().set_message_reaction(
+            chat_id=message.chat_id,
+            message_id=message.id,
+            reaction=ReactionTypeEmoji(_status_emoji(status)),
+        )
+    except TelegramError as exc:
+        logger.debug("reaction failed chat=%s: %s", message.chat_id, exc)
 
 
 async def _reply_html(update: Update, text: str) -> None:
     message = update.effective_message
     if message is not None:
         await message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-async def _reply_begin_failure(
-    update: Update, outcome: Unresolved | Ambiguous, log_name: str
-) -> None:
-    """Reply for begin's two resolve failures (old _require_unique_id,
-    verbatim log shapes and reply strings).
-
-    The decision itself is state.begin (pure, tested) — this adds only
-    the log line and the reply.
-    """
-    if isinstance(outcome, Unresolved):
-        logger.debug("%s: no match (%d state(s))", log_name, outcome.list_count)
-        await _reply(update, "No match in the last shown list")
-        return
-    logger.debug("%s: ambiguous, %d matches", log_name, outcome.count)
-    await _reply(update, f"Ambiguous — matches {outcome.count} tasks, be more specific")
 
 
 def _md_html(text: str) -> str:
@@ -498,11 +462,15 @@ async def _send_list(
     todoist: TodoistClient,
     project_id: str,
     headline: str | None = None,
+    *,
+    already_confirmed: bool = False,
 ) -> None:
     """Send the rendered list, optionally under an HTML headline line.
 
     Stores the list so /done, /undo and /edit act on it: entities go
     into the chat's task map first, then the id order points at them.
+    `already_confirmed` means the caller delivered the status line
+    another way (REACTION_REPLIES reaction) — skip the headline echo.
     """
     message = update.effective_message
     if message is None:
@@ -522,7 +490,10 @@ async def _send_list(
     if not chunks:
         set_chat_list(context.chat_data, None)
         if headline is not None:
-            await _reply_html(update, headline)
+            # Reaction mode already got its status line from cmd_add;
+            # don't also echo the headline.
+            if not already_confirmed:
+                await _reply_html(update, headline)
         elif cutoff > today:
             await _reply(update, f"Nothing due by {_fmt_due(cutoff, today)} 🎉")
         else:
@@ -690,6 +661,19 @@ def _is_group_chat_type(kind: str) -> bool:
     return kind in {"group", "supergroup"}
 
 
+def _reaction_mode_applies(reaction_replies: bool, chat_type: str | None) -> bool:
+    """Whether REACTION_REPLIES answers this chat with a reaction.
+
+    Reaction mode is a group-chat feature: private chats, channels and
+    chats without a resolvable type always get the text reply.
+    `chat_type` is `Chat.type` — annotated `str`, actually ChatType (a
+    str-enum), which compares equal to "group"/"supergroup".
+    """
+    return bool(
+        reaction_replies and chat_type is not None and _is_group_chat_type(chat_type)
+    )
+
+
 async def _morning_loop(
     cfg: Config, project: Project, todoist: TodoistClient, application: Application
 ) -> None:
@@ -797,6 +781,99 @@ def build_application(
     )
     mentions = _mentions_lookup(cfg)
 
+    def _should_react(update: Update) -> bool:
+        chat = update.effective_chat
+        return _reaction_mode_applies(
+            cfg.reaction_replies, chat.type if chat is not None else None
+        )
+
+    async def _respond(
+        update: Update, status: Status, text: str, *, html: bool = False
+    ) -> None:
+        """Action-command feedback: status reaction or the text reply.
+
+        With _should_react the command message gets 👍/🤨/👎 (see
+        _status_emoji) and nothing is posted; a failed reaction logs at
+        DEBUG and stays silent — no text fallback.  Otherwise the
+        reply strings are byte-identical to pre-reaction mode.
+        """
+        if _should_react(update):
+            await _react(update, status)
+            return
+        if html:
+            await _reply_html(update, text)
+        else:
+            await _reply(update, text)
+
+    async def _respond_safely(update: Update, status: Status, text: str) -> None:
+        try:
+            await _respond(update, status, text)
+        except TelegramError:
+            logger.exception("could not send reply")
+
+    async def _reply_begin_failure(
+        update: Update, outcome: Unresolved | Ambiguous, log_name: str
+    ) -> None:
+        """Reply for begin's two resolve failures (old _require_unique_id,
+        verbatim log shapes and reply strings).
+
+        The decision itself is state.begin (pure, tested) — this adds only
+        the log line and the reply.
+        """
+        if isinstance(outcome, Unresolved):
+            logger.debug("%s: no match (%d state(s))", log_name, outcome.list_count)
+            await _respond(update, "soft", "No match in the last shown list")
+            return
+        logger.debug("%s: ambiguous, %d matches", log_name, outcome.count)
+        await _respond(
+            update,
+            "soft",
+            f"Ambiguous — matches {outcome.count} tasks, be more specific",
+        )
+
+    def guarded(handler: Handler, *, typing: bool = False) -> Handler:
+        @functools.wraps(handler)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            started = asyncio.get_running_loop().time()
+            chat = update.effective_chat
+            user = update.effective_user
+            # Ids only — never usernames, chat titles, message text or
+            # command arguments.
+            logger.debug(
+                "%s chat=%s user=%s",
+                handler.__name__,
+                chat.id if chat else None,
+                user.id if user else None,
+            )
+            ticker: asyncio.Task[None] | None = None
+            try:
+                if typing:
+                    ticker = await _start_typing(update, context)
+                await handler(update, context)
+                logger.debug(
+                    "%s done in %.0fms",
+                    handler.__name__,
+                    (asyncio.get_running_loop().time() - started) * 1000,
+                )
+            except TodoistError as exc:
+                logger.warning("%s failed: %s", handler.__name__, exc)
+                await _respond_safely(update, "hard", f"⚠ {exc}")
+            except TelegramError:
+                logger.exception("Telegram error in %s", handler.__name__)
+                await _respond_safely(
+                    update,
+                    "hard",
+                    f"⚠ Telegram send failed — the command may have "
+                    f"completed; check with {_LIST_CMDS} or /mine",
+                )
+            except Exception:
+                logger.exception("Unhandled error in %s", handler.__name__)
+                await _respond_safely(update, "hard", "Unexpected error")
+            finally:
+                await _stop_typing(ticker)
+
+        return wrapper
+
     async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _HELP.format(project=project.name))
 
@@ -806,13 +883,14 @@ def build_application(
             return
         text = " ".join(context.args or []).strip()
         if not text:
-            await _reply(
+            await _respond(
                 update,
+                "soft",
                 "Usage: /add <task text> — e.g. /add buy milk tomorrow p1",
             )
             return
         if len(text) > 500:
-            await _reply(update, "Task text too long — max 500 characters")
+            await _respond(update, "soft", "Task text too long — max 500 characters")
             return
         async with _chat_lock(chat.id):
             task = await todoist.add_task_in_project(text, project)
@@ -825,18 +903,24 @@ def build_application(
                 task_list = None
             cutoff = task_list.cutoff if task_list is not None else today
             if day is None or day > cutoff:
-                await _reply_html(update, headline)
+                await _respond(update, "ok", headline, html=True)
                 return
             try:
                 tasks = await todoist.tasks_due_by(project.id, cutoff)
             except TodoistError:
                 # The add itself succeeded — report it; only the list
                 # refresh failed.
-                await _reply_html(
+                await _respond(
                     update,
+                    "ok",
                     f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}",
+                    html=True,
                 )
                 return
+            # "Will react", not "did react": if Telegram then rejects
+            # the reaction the headline echo stays suppressed too —
+            # zero status is the mandated no-fallback contract.
+            confirmed = _should_react(update)
             await _send_list(
                 update,
                 context,
@@ -847,7 +931,12 @@ def build_application(
                 todoist,
                 project.id,
                 headline=headline,
+                already_confirmed=confirmed,
             )
+            if confirmed:
+                # The list above is content and still goes out; the
+                # reaction is the action's status line.
+                await _react(update, "ok")
 
     def _cmd_list(days: int, name: str) -> Handler:
         async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -888,12 +977,13 @@ def build_application(
             # active_lists pruned stale /mine lists; a stale chat list
             # is cleared here so the message explains the expiry once.
             set_chat_list(context.chat_data, None)
-            await _reply(
+            await _respond(
                 update,
+                "soft",
                 f"The last list is from a previous day — send {_LIST_CMDS} " "or /mine",
             )
         else:
-            await _reply(update, f"Send {_LIST_CMDS} or /mine first")
+            await _respond(update, "soft", f"Send {_LIST_CMDS} or /mine first")
         return None
 
     async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -903,8 +993,10 @@ def build_application(
             return
         query = " ".join(context.args or []).strip()
         if not query:
-            await _reply(
-                update, f"Usage: /done <id> — id shown by {_LIST_CMDS} or /mine"
+            await _respond(
+                update,
+                "soft",
+                f"Usage: /done <id> — id shown by {_LIST_CMDS} or /mine",
             )
             return
         async with _chat_lock(chat.id):
@@ -918,8 +1010,10 @@ def build_application(
                     return
                 case Rejected() as rej:
                     logger.debug("cmd_done task=%s: already done", rej.task_id)
-                    await _reply(
-                        update, f"Already completed — send {_LIST_CMDS} to refresh"
+                    await _respond(
+                        update,
+                        "soft",
+                        f"Already completed — send {_LIST_CMDS} to refresh",
                     )
                     return
                 case Permitted() as ok:
@@ -927,7 +1021,11 @@ def build_application(
             try:
                 await todoist.complete_task(ok.task_id)
             except TodoistError as exc:
-                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
+                await _respond(
+                    update,
+                    "hard",
+                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
+                )
                 return
             next_due: date | None = None
             if ok.item.recurring:
@@ -966,13 +1064,17 @@ def build_application(
                 get_tasks(context.chat_data),
             )
             if ok.item.recurring and next_due is not None:
-                await _reply_html(
+                await _respond(
                     update,
+                    "ok",
                     f"✅ {_render_text(ok.item.text)} — "
                     f"next occurrence: {_fmt_due(next_due, cfg.today())}",
+                    html=True,
                 )
             else:
-                await _reply_html(update, f"✅ {_render_text(ok.item.text)}")
+                await _respond(
+                    update, "ok", f"✅ {_render_text(ok.item.text)}", html=True
+                )
 
     async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -981,8 +1083,10 @@ def build_application(
             return
         query = " ".join(context.args or []).strip()
         if not query:
-            await _reply(
-                update, f"Usage: /undo <id> — id shown by {_LIST_CMDS} or /mine"
+            await _respond(
+                update,
+                "soft",
+                f"Usage: /undo <id> — id shown by {_LIST_CMDS} or /mine",
             )
             return
         async with _chat_lock(chat.id):
@@ -1001,16 +1105,24 @@ def build_application(
                         # that *ended* on the last occurrence could be
                         # undone, but distinguishing the two needs extra
                         # state — accepted false negative.
-                        await _reply(update, "⚠ can't undo a recurring completion")
+                        await _respond(
+                            update, "soft", "⚠ can't undo a recurring completion"
+                        )
                     else:
-                        await _reply(update, "Not completed — nothing to undo")
+                        await _respond(
+                            update, "soft", "Not completed — nothing to undo"
+                        )
                     return
                 case Permitted() as ok:
                     pass
             try:
                 await todoist.uncomplete_task(ok.task_id)
             except TodoistError as exc:
-                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
+                await _respond(
+                    update,
+                    "hard",
+                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
+                )
                 return
             applied = commit(
                 context.chat_data, user.id, cfg.today(), ok.task_id, Reopen()
@@ -1030,7 +1142,7 @@ def build_application(
                 mentions,
                 get_tasks(context.chat_data),
             )
-            await _reply_html(update, f"↩️ {_render_text(ok.item.text)}")
+            await _respond(update, "ok", f"↩️ {_render_text(ok.item.text)}", html=True)
 
     async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -1040,14 +1152,15 @@ def build_application(
         raw = " ".join(context.args or []).strip()
         query, separator, new_text = raw.partition(" ")
         if not separator or not new_text.strip():
-            await _reply(
+            await _respond(
                 update,
+                "soft",
                 "Usage: /edit <id> <new text> — e.g. /edit 5c buy milk",
             )
             return
         new_text = new_text.strip()
         if len(new_text) > 500:
-            await _reply(update, "Task text too long — max 500 characters")
+            await _respond(update, "soft", "Task text too long — max 500 characters")
             return
         async with _chat_lock(chat.id):
             if await _require_lists(update, context, user.id) is None:
@@ -1063,14 +1176,18 @@ def build_application(
                     logger.debug(
                         "cmd_edit task=%s: already done, refusing", rej.task_id
                     )
-                    await _reply(update, "Already completed — can't edit")
+                    await _respond(update, "soft", "Already completed — can't edit")
                     return
                 case Permitted() as ok:
                     pass
             try:
                 await todoist.update_task_content(ok.task_id, new_text)
             except TodoistError as exc:
-                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
+                await _respond(
+                    update,
+                    "hard",
+                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
+                )
                 return
             applied = commit(context.chat_data, user.id, cfg.today(), ok.task_id, event)
             # Unreachable in practice: sequential updates under the
@@ -1088,7 +1205,7 @@ def build_application(
                 mentions,
                 get_tasks(context.chat_data),
             )
-            await _reply_html(update, f"✏️ {_render_text(new_text)}")
+            await _respond(update, "ok", f"✏️ {_render_text(new_text)}", html=True)
 
     async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -1098,8 +1215,9 @@ def build_application(
         raw = " ".join(context.args or []).strip()
         query, separator, raw_assignee = raw.partition(" ")
         if not separator or not raw_assignee.strip():
-            await _reply(
+            await _respond(
                 update,
+                "soft",
                 "Usage: /assign <id> <assignee> — e.g. /assign 5c @abnv "
                 "or /assign 5c Priya Singh",
             )
@@ -1125,7 +1243,7 @@ def build_application(
                     logger.debug(
                         "cmd_assign task=%s: already done, refusing", rej.task_id
                     )
-                    await _reply(update, "Already completed — can't assign")
+                    await _respond(update, "soft", "Already completed — can't assign")
                     return
                 case Permitted() as ok:
                     pass
@@ -1148,8 +1266,9 @@ def build_application(
                     ok.task_id,
                     len(candidates),
                 )
-                await _reply(
+                await _respond(
                     update,
+                    "soft",
                     f"Todoist collaborator {raw_assignee.strip()!r} not found on "
                     "this project (or the lookup failed) — check the name or "
                     "ASSIGNEE_MENTIONS",
@@ -1161,8 +1280,9 @@ def build_application(
                     ok.task_id,
                     len(assignee_ids),
                 )
-                await _reply(
+                await _respond(
                     update,
+                    "soft",
                     f"Ambiguous — {raw_assignee.strip()!r} matches "
                     f"{len(assignee_ids)} collaborators, use their full Todoist name",
                 )
@@ -1178,7 +1298,11 @@ def build_application(
             try:
                 await todoist.update_task_assignee(ok.task_id, collaborator_id)
             except TodoistError as exc:
-                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
+                await _respond(
+                    update,
+                    "hard",
+                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
+                )
                 return
             applied = commit(
                 context.chat_data,
@@ -1206,7 +1330,12 @@ def build_application(
             # _assignee_suffix is a line suffix (" — @handle"); the
             # confirmation already draws its own arrow separator.
             mention = _assignee_suffix(assignee_name, mentions).removeprefix(" — ")
-            await _reply_html(update, f"👤 {_render_text(ok.item.text)} → {mention}")
+            await _respond(
+                update,
+                "ok",
+                f"👤 {_render_text(ok.item.text)} → {mention}",
+                html=True,
+            )
 
     async def cmd_due(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -1216,8 +1345,9 @@ def build_application(
         raw = " ".join(context.args or []).strip()
         query, separator, raw_when = raw.partition(" ")
         if not separator or not raw_when.strip():
-            await _reply(
+            await _respond(
                 update,
+                "soft",
                 "Usage: /due <id> <when> — e.g. /due 5c tomorrow 5pm, "
                 "/due 5c next monday or /due 5c no date",
             )
@@ -1241,7 +1371,9 @@ def build_application(
                     return
                 case Rejected() as rej:
                     logger.debug("cmd_due task=%s: already done, refusing", rej.task_id)
-                    await _reply(update, "Already completed — can't reschedule")
+                    await _respond(
+                        update, "soft", "Already completed — can't reschedule"
+                    )
                     return
                 case Permitted() as ok:
                     pass
@@ -1249,7 +1381,9 @@ def build_application(
             if len(when) > 150:
                 # Reject rather than truncate: a cut natural-language
                 # string can parse to a valid but *different* date.
-                await _reply(update, "Date string too long — max 150 characters")
+                await _respond(
+                    update, "soft", "Date string too long — max 150 characters"
+                )
                 return
             # Todoist's server-side parser resolves the string (same
             # parser as quick-add); garbled input comes back as a
@@ -1257,7 +1391,11 @@ def build_application(
             try:
                 updated = await todoist.update_task_due(ok.task_id, when)
             except TodoistError as exc:
-                await _reply(update, f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh")
+                await _respond(
+                    update,
+                    "hard",
+                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
+                )
                 return
             day = effective_day(updated.due, updated.deadline, cfg.resolved_timezone)
             is_recurring = bool(updated.due and updated.due.is_recurring)
@@ -1282,11 +1420,18 @@ def build_application(
                 get_tasks(context.chat_data),
             )
             if day is None:
-                await _reply_html(update, f"📅 {_render_text(ok.item.text)} → no date")
-            else:
-                await _reply_html(
+                await _respond(
                     update,
+                    "ok",
+                    f"📅 {_render_text(ok.item.text)} → no date",
+                    html=True,
+                )
+            else:
+                await _respond(
+                    update,
+                    "ok",
                     f"📅 {_render_text(ok.item.text)} → {_fmt_due(day, cfg.today())}",
+                    html=True,
                 )
 
     async def cmd_mine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1302,8 +1447,9 @@ def build_application(
             )
             if assignee_name is None:
                 logger.debug("cmd_mine user=%s: no ASSIGNEE_MENTIONS mapping", user.id)
-                await _reply(
+                await _respond(
                     update,
+                    "soft",
                     "I can't match your Telegram account to a Todoist "
                     "collaborator — set ASSIGNEE_MENTIONS "
                     "(Todoist Name=@you or Name=<numeric id>) and retry",
@@ -1316,8 +1462,9 @@ def build_application(
                 logger.debug(
                     "cmd_mine user=%s: collaborator not in project cache", user.id
                 )
-                await _reply(
+                await _respond(
                     update,
+                    "soft",
                     f"Todoist collaborator {assignee_name!r} not found on this "
                     "project (or the lookup failed) — check ASSIGNEE_MENTIONS "
                     "and retry /mine",
@@ -1388,7 +1535,7 @@ def build_application(
             addressed = first.partition("@")[2].casefold()
             if addressed != context.bot.username.casefold():
                 return
-        await _reply(update, "Unknown command — try /help")
+        await _respond(update, "soft", "Unknown command — try /help")
 
     morning_task: asyncio.Task[None] | None = None
 
@@ -1425,7 +1572,7 @@ def build_application(
     ) -> None:
         logger.error("Unhandled exception", exc_info=context.error)
         if isinstance(update, Update):
-            await _reply_safely(update)
+            await _respond_safely(update, "hard", "Unexpected error")
 
     application = (
         Application.builder()

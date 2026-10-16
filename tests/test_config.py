@@ -215,6 +215,36 @@ class TestMorningAnnounceWhenEmpty:
             make_config(MORNING_ANNOUNCE_WHEN_EMPTY=raw)
 
 
+class TestReactionReplies:
+    def test_default_is_false(self) -> None:
+        assert make_config().reaction_replies is False
+
+    def test_unset_is_false(self) -> None:
+        cfg = make_config(REACTION_REPLIES="")
+        assert cfg.reaction_replies is False
+
+    def test_true_parses(self) -> None:
+        cfg = make_config(REACTION_REPLIES="true")
+        assert cfg.reaction_replies is True
+
+    def test_false_parses(self) -> None:
+        cfg = make_config(REACTION_REPLIES="false")
+        assert cfg.reaction_replies is False
+
+    def test_case_insensitive(self) -> None:
+        cfg = make_config(REACTION_REPLIES="True")
+        assert cfg.reaction_replies is True
+
+    def test_padded_value_accepted(self) -> None:
+        cfg = make_config(REACTION_REPLIES="  true  ")
+        assert cfg.reaction_replies is True
+
+    @pytest.mark.parametrize("raw", ["yes", "no", "1", "0", "on"])
+    def test_invalid_rejected(self, raw: str) -> None:
+        with pytest.raises(ConfigError, match="REACTION_REPLIES"):
+            make_config(REACTION_REPLIES=raw)
+
+
 class TestSecrets:
     def test_repr_masks_tokens(self) -> None:
         cfg = make_config()

@@ -29,6 +29,11 @@ class Config:
     # Whether the daily announcement is sent when nothing is due
     # (MORNING_ANNOUNCE_WHEN_EMPTY=true|false, default true).
     morning_announce_when_empty: bool = True
+    # Whether action commands answer with a reaction on the command
+    # message instead of a reply (REACTION_REPLIES=true|false, default
+    # false).  List-style commands (/today, /tomorrow, /week, /mine
+    # lists, /help, /start, /project) always reply.
+    reaction_replies: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -43,6 +48,7 @@ class Config:
             assignee_mentions=_parse_assignee_mentions(env),
             log_level=_parse_log_level(env),
             morning_announce_when_empty=_parse_morning_announce_when_empty(env),
+            reaction_replies=_parse_reaction_replies(env),
         )
 
     def today(self) -> date:
@@ -138,6 +144,24 @@ def _parse_morning_announce_when_empty(env: Mapping[str, str]) -> bool:
     raise ConfigError(
         f"MORNING_ANNOUNCE_WHEN_EMPTY is not 'true' or 'false': {original!r}"
     )
+
+
+def _parse_reaction_replies(env: Mapping[str, str]) -> bool:
+    """REACTION_REPLIES: 'true' or 'false' (case-insensitive).
+
+    Unset defaults to false — the historical behavior (every action
+    command replies with text).  true answers actions with a reaction
+    on the command message: 👍 success, 🤨 soft refusal, 👎 failure.
+    """
+    original = env.get("REACTION_REPLIES", "").strip()
+    if not original:
+        return False
+    value = original.casefold()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ConfigError(f"REACTION_REPLIES is not 'true' or 'false': {original!r}")
 
 
 def _parse_assignee_mentions(env: Mapping[str, str]) -> dict[str, str]:
