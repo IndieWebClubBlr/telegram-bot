@@ -7,8 +7,9 @@ import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, tzinfo
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from markdown_it import MarkdownIt
 from telegram import Message, ReactionTypeEmoji, Update
@@ -31,6 +32,7 @@ from .state import (
     Assign,
     Complete,
     Edit,
+    Event,
     Permitted,
     Rejected,
     Reopen,
@@ -57,6 +59,20 @@ from .todoist_client import DueTask, TodoistClient, TodoistError, effective_day
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]]
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """perform()'s result: the state event to commit and the ok reply.
+
+    `log_extra` feeds command-specific bits in log_applied overrides
+    (e.g. /assign's collaborator id).
+    """
+
+    event: Event
+    success: str
+    log_extra: str | None = None
+
 
 _MESSAGE_LIMIT = 4000
 _TELEGRAM_LIMIT = 4096
@@ -986,40 +1002,117 @@ def build_application(
             await _respond(update, "soft", f"Send {_LIST_CMDS} or /mine first")
         return None
 
-    async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    class _ListAction:
+        """A list-mutating command backed by the begin/commit FSM.
+
+        _run_action owns the shared shell — arg split, chat lock,
+        require lists, begin, perform, commit, list re-edit, ok reply
+        — so a subclass supplies only its distinct pieces: usage text,
+        the begin event, the rejected reply, and the perform()
+        mutation.          The optional hooks (split, validate,
+        rejected_debug, applied_verb, log_applied) have working
+        defaults; add a new command by subclassing here — set log_name,
+        implement usage/begin_event/rejected_reply/perform — and
+        registering _action_handler(MyCommand()).
+
+        Defined inside build_application so methods close over cfg,
+        todoist, project, mentions and the _respond/_edit_lists
+        helpers.
+        """
+
+        log_name: ClassVar[str]
+
+        def usage(self) -> str:
+            raise NotImplementedError
+
+        def begin_event(self, rest: str) -> Event:
+            raise NotImplementedError
+
+        def rejected_reply(self, rej: Rejected) -> str:
+            raise NotImplementedError
+
+        async def perform(
+            self, update: Update, ok: Permitted, rest: str
+        ) -> _Outcome | None:
+            """Mutate Todoist and build the commit event + ok reply.
+
+            Return None only after replying the abort yourself (the
+            shell stops without committing).  TodoistError propagates:
+            the shell replies the shared hard-failure line.
+            """
+            raise NotImplementedError
+
+        def split(self, raw: str) -> tuple[str, str] | None:
+            """(query, rest) for begin/perform — base splits `<id> <rest>`."""
+            query, separator, rest = raw.partition(" ")
+            if not separator or not rest.strip():
+                return None
+            return query, rest.strip()
+
+        def validate(self, rest: str) -> str | None:
+            """Pre-lock check; return a soft-reply text to abort with."""
+            return None
+
+        def rejected_debug(self, rej: Rejected) -> str | None:
+            return None
+
+        def applied_verb(self) -> str:
+            return "applied"
+
+        def log_applied(
+            self, ok: Permitted, applied: Applied, outcome: _Outcome
+        ) -> None:
+            logger.debug(
+                "%s task=%s: %s, updated %d displaying list(s)",
+                self.log_name,
+                ok.task_id,
+                self.applied_verb(),
+                len(applied.touched),
+            )
+
+    async def _run_action(
+        command: _ListAction, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Shared shell for _ListAction commands — see the class doc."""
         chat = update.effective_chat
         user = update.effective_user
         if chat is None or user is None:
             return
-        query = " ".join(context.args or []).strip()
-        if not query:
-            await _respond(
-                update,
-                "soft",
-                f"Usage: /done <id> — id shown by {_LIST_CMDS} or /mine",
-            )
+        parts = command.split(" ".join(context.args or []).strip())
+        if parts is None:
+            await _respond(update, "soft", command.usage())
+            return
+        query, rest = parts
+        too_long = command.validate(rest)
+        if too_long is not None:
+            await _respond(update, "soft", too_long)
             return
         async with _chat_lock(chat.id):
             if await _require_lists(update, context, user.id) is None:
                 return
-            folded = query.casefold()
-            outcome = begin(context.chat_data, user.id, cfg.today(), folded, Complete())
+            outcome = begin(
+                context.chat_data,
+                user.id,
+                cfg.today(),
+                query.casefold(),
+                command.begin_event(rest),
+            )
             match outcome:
                 case Unresolved() | Ambiguous() as fail:
-                    await _reply_begin_failure(update, fail, "cmd_done")
+                    await _reply_begin_failure(update, fail, command.log_name)
                     return
                 case Rejected() as rej:
-                    logger.debug("cmd_done task=%s: already done", rej.task_id)
-                    await _respond(
-                        update,
-                        "soft",
-                        f"Already completed — send {_LIST_CMDS} to refresh",
-                    )
+                    debug = command.rejected_debug(rej)
+                    if debug is not None:
+                        logger.debug(
+                            "%s task=%s: %s", command.log_name, rej.task_id, debug
+                        )
+                    await _respond(update, "soft", command.rejected_reply(rej))
                     return
                 case Permitted() as ok:
                     pass
             try:
-                await todoist.complete_task(ok.task_id)
+                result = await command.perform(update, ok, rest)
             except TodoistError as exc:
                 await _respond(
                     update,
@@ -1027,6 +1120,51 @@ def build_application(
                     f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
                 )
                 return
+            if result is None:
+                return
+            applied = commit(
+                context.chat_data, user.id, cfg.today(), ok.task_id, result.event
+            )
+            # Unreachable in practice: sequential updates under the
+            # chat lock keep the phase stable between begin and commit.
+            assert isinstance(applied, Applied)
+            command.log_applied(ok, applied, result)
+            await _edit_lists(
+                update,
+                context,
+                applied.touched,
+                mentions,
+                get_tasks(context.chat_data),
+            )
+            await _respond(update, "ok", result.success, html=True)
+
+    def _action_handler(command: _ListAction) -> Handler:
+        async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            await _run_action(command, update, context)
+
+        cmd.__name__ = command.log_name
+        return guarded(cmd, typing=True)
+
+    class DoneCommand(_ListAction):
+        log_name = "cmd_done"
+
+        def usage(self) -> str:
+            return f"Usage: /done <id> — id shown by {_LIST_CMDS} or /mine"
+
+        def split(self, raw: str) -> tuple[str, str] | None:
+            return (raw, "") if raw else None
+
+        def begin_event(self, rest: str) -> Complete:
+            return Complete()
+
+        def rejected_reply(self, rej: Rejected) -> str:
+            return f"Already completed — send {_LIST_CMDS} to refresh"
+
+        def rejected_debug(self, rej: Rejected) -> str | None:
+            return "already done"
+
+        async def perform(self, update: Update, ok: Permitted, rest: str) -> _Outcome:
+            await todoist.complete_task(ok.task_id)
             next_due: date | None = None
             if ok.item.recurring:
                 try:
@@ -1041,215 +1179,102 @@ def build_application(
             # displaying it.  Complete's due sentinel: UNSET leaves the
             # date alone — a bare done must not clear the line — while a
             # rolled recurring date replaces it.
-            applied = commit(
-                context.chat_data,
-                user.id,
-                cfg.today(),
-                ok.task_id,
-                Complete(due=next_due if next_due is not None else UNSET),
-            )
-            # Unreachable in practice: sequential updates under the
-            # chat lock keep the phase stable between begin and commit.
-            assert isinstance(applied, Applied)
-            logger.debug(
-                "cmd_done task=%s: completed, updated %d displaying list(s)",
-                ok.task_id,
-                len(applied.touched),
-            )
-            await _edit_lists(
-                update,
-                context,
-                applied.touched,
-                mentions,
-                get_tasks(context.chat_data),
-            )
+            event = Complete(due=next_due if next_due is not None else UNSET)
             if ok.item.recurring and next_due is not None:
-                await _respond(
-                    update,
-                    "ok",
-                    f"✅ {_render_text(ok.item.text)} — "
-                    f"next occurrence: {_fmt_due(next_due, cfg.today())}",
-                    html=True,
+                return _Outcome(
+                    event=event,
+                    success=(
+                        f"✅ {_render_text(ok.item.text)} — "
+                        f"next occurrence: {_fmt_due(next_due, cfg.today())}"
+                    ),
                 )
-            else:
-                await _respond(
-                    update, "ok", f"✅ {_render_text(ok.item.text)}", html=True
-                )
+            return _Outcome(event=event, success=f"✅ {_render_text(ok.item.text)}")
 
-    async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat is None or user is None:
-            return
-        query = " ".join(context.args or []).strip()
-        if not query:
-            await _respond(
-                update,
-                "soft",
-                f"Usage: /undo <id> — id shown by {_LIST_CMDS} or /mine",
-            )
-            return
-        async with _chat_lock(chat.id):
-            if await _require_lists(update, context, user.id) is None:
-                return
-            folded = query.casefold()
-            outcome = begin(context.chat_data, user.id, cfg.today(), folded, Reopen())
-            match outcome:
-                case Unresolved() | Ambiguous() as fail:
-                    await _reply_begin_failure(update, fail, "cmd_undo")
-                    return
-                case Rejected() as rej:
-                    if rej.reason == "recurring":
-                        # Blanket refusal: undoing a rolled completion is
-                        # unsafe (the series already advanced); a series
-                        # that *ended* on the last occurrence could be
-                        # undone, but distinguishing the two needs extra
-                        # state — accepted false negative.
-                        await _respond(
-                            update, "soft", "⚠ can't undo a recurring completion"
-                        )
-                    else:
-                        await _respond(
-                            update, "soft", "Not completed — nothing to undo"
-                        )
-                    return
-                case Permitted() as ok:
-                    pass
-            try:
-                await todoist.uncomplete_task(ok.task_id)
-            except TodoistError as exc:
-                await _respond(
-                    update,
-                    "hard",
-                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
-                )
-                return
-            applied = commit(
-                context.chat_data, user.id, cfg.today(), ok.task_id, Reopen()
-            )
-            # Unreachable in practice: sequential updates under the
-            # chat lock keep the phase stable between begin and commit.
-            assert isinstance(applied, Applied)
-            logger.debug(
-                "cmd_undo task=%s: reopened, updated %d displaying list(s)",
-                ok.task_id,
-                len(applied.touched),
-            )
-            await _edit_lists(
-                update,
-                context,
-                applied.touched,
-                mentions,
-                get_tasks(context.chat_data),
-            )
-            await _respond(update, "ok", f"↩️ {_render_text(ok.item.text)}", html=True)
+        def applied_verb(self) -> str:
+            return "completed"
 
-    async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat is None or user is None:
-            return
-        raw = " ".join(context.args or []).strip()
-        query, separator, new_text = raw.partition(" ")
-        if not separator or not new_text.strip():
-            await _respond(
-                update,
-                "soft",
-                "Usage: /edit <id> <new text> — e.g. /edit 5c buy milk",
-            )
-            return
-        new_text = new_text.strip()
-        if len(new_text) > 500:
-            await _respond(update, "soft", "Task text too long — max 500 characters")
-            return
-        async with _chat_lock(chat.id):
-            if await _require_lists(update, context, user.id) is None:
-                return
-            folded = query.casefold()
-            event = Edit(text=new_text)
-            outcome = begin(context.chat_data, user.id, cfg.today(), folded, event)
-            match outcome:
-                case Unresolved() | Ambiguous() as fail:
-                    await _reply_begin_failure(update, fail, "cmd_edit")
-                    return
-                case Rejected() as rej:
-                    logger.debug(
-                        "cmd_edit task=%s: already done, refusing", rej.task_id
-                    )
-                    await _respond(update, "soft", "Already completed — can't edit")
-                    return
-                case Permitted() as ok:
-                    pass
-            try:
-                await todoist.update_task_content(ok.task_id, new_text)
-            except TodoistError as exc:
-                await _respond(
-                    update,
-                    "hard",
-                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
-                )
-                return
-            applied = commit(context.chat_data, user.id, cfg.today(), ok.task_id, event)
-            # Unreachable in practice: sequential updates under the
-            # chat lock keep the phase stable between begin and commit.
-            assert isinstance(applied, Applied)
-            logger.debug(
-                "cmd_edit task=%s: renamed, updated %d displaying list(s)",
-                ok.task_id,
-                len(applied.touched),
-            )
-            await _edit_lists(
-                update,
-                context,
-                applied.touched,
-                mentions,
-                get_tasks(context.chat_data),
-            )
-            await _respond(update, "ok", f"✏️ {_render_text(new_text)}", html=True)
+    class UndoCommand(_ListAction):
+        log_name = "cmd_undo"
 
-    async def cmd_assign(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat is None or user is None:
-            return
-        raw = " ".join(context.args or []).strip()
-        query, separator, raw_assignee = raw.partition(" ")
-        if not separator or not raw_assignee.strip():
-            await _respond(
-                update,
-                "soft",
+        def usage(self) -> str:
+            return f"Usage: /undo <id> — id shown by {_LIST_CMDS} or /mine"
+
+        def split(self, raw: str) -> tuple[str, str] | None:
+            return (raw, "") if raw else None
+
+        def begin_event(self, rest: str) -> Reopen:
+            return Reopen()
+
+        def rejected_reply(self, rej: Rejected) -> str:
+            if rej.reason == "recurring":
+                # Blanket refusal: undoing a rolled completion is
+                # unsafe (the series already advanced); a series that
+                # *ended* on the last occurrence could be undone, but
+                # distinguishing the two needs extra state — accepted
+                # false negative.
+                return "⚠ can't undo a recurring completion"
+            return "Not completed — nothing to undo"
+
+        async def perform(self, update: Update, ok: Permitted, rest: str) -> _Outcome:
+            await todoist.uncomplete_task(ok.task_id)
+            return _Outcome(event=Reopen(), success=f"↩️ {_render_text(ok.item.text)}")
+
+        def applied_verb(self) -> str:
+            return "reopened"
+
+    class EditCommand(_ListAction):
+        log_name = "cmd_edit"
+
+        def usage(self) -> str:
+            return "Usage: /edit <id> <new text> — e.g. /edit 5c buy milk"
+
+        def validate(self, rest: str) -> str | None:
+            if len(rest) > 500:
+                return "Task text too long — max 500 characters"
+            return None
+
+        def begin_event(self, rest: str) -> Edit:
+            return Edit(text=rest)
+
+        def rejected_reply(self, rej: Rejected) -> str:
+            return "Already completed — can't edit"
+
+        def rejected_debug(self, rej: Rejected) -> str | None:
+            return "already done, refusing"
+
+        async def perform(self, update: Update, ok: Permitted, rest: str) -> _Outcome:
+            await todoist.update_task_content(ok.task_id, rest)
+            return _Outcome(event=Edit(text=rest), success=f"✏️ {_render_text(rest)}")
+
+        def applied_verb(self) -> str:
+            return "renamed"
+
+    class AssignCommand(_ListAction):
+        log_name = "cmd_assign"
+
+        def usage(self) -> str:
+            return (
                 "Usage: /assign <id> <assignee> — e.g. /assign 5c @abnv "
-                "or /assign 5c Priya Singh",
+                "or /assign 5c Priya Singh"
             )
-            return
-        async with _chat_lock(chat.id):
-            if await _require_lists(update, context, user.id) is None:
-                return
-            folded = query.casefold()
+
+        def begin_event(self, rest: str) -> Assign:
             # begin validates the event's type only; the Todoist-canonical
-            # assignee name is resolved below and carried by commit.
-            outcome = begin(
-                context.chat_data,
-                user.id,
-                cfg.today(),
-                folded,
-                Assign(assignee=raw_assignee.strip()),
-            )
-            match outcome:
-                case Unresolved() | Ambiguous() as fail:
-                    await _reply_begin_failure(update, fail, "cmd_assign")
-                    return
-                case Rejected() as rej:
-                    logger.debug(
-                        "cmd_assign task=%s: already done, refusing", rej.task_id
-                    )
-                    await _respond(update, "soft", "Already completed — can't assign")
-                    return
-                case Permitted() as ok:
-                    pass
+            # assignee name is resolved in perform and carried by commit.
+            return Assign(assignee=rest.strip())
+
+        def rejected_reply(self, rej: Rejected) -> str:
+            return "Already completed — can't assign"
+
+        def rejected_debug(self, rej: Rejected) -> str | None:
+            return "already done, refusing"
+
+        async def perform(
+            self, update: Update, ok: Permitted, rest: str
+        ) -> _Outcome | None:
             # Raw mapping (original casing) — `mentions` here is the
             # casefolded render lookup and would store lowercase names.
-            candidates = assignee_name_candidates(raw_assignee, cfg.assignee_mentions)
+            candidates = assignee_name_candidates(rest, cfg.assignee_mentions)
             # Resolve every candidate name (a bare @handle can map to
             # several Todoist names); genuine ambiguity is more than
             # one distinct collaborator.
@@ -1269,11 +1294,11 @@ def build_application(
                 await _respond(
                     update,
                     "soft",
-                    f"Todoist collaborator {raw_assignee.strip()!r} not found on "
+                    f"Todoist collaborator {rest!r} not found on "
                     "this project (or the lookup failed) — check the name or "
                     "ASSIGNEE_MENTIONS",
                 )
-                return
+                return None
             if len(assignee_ids) > 1:
                 logger.debug(
                     "cmd_assign task=%s: ambiguous assignee, %d collaborators",
@@ -1283,10 +1308,10 @@ def build_application(
                 await _respond(
                     update,
                     "soft",
-                    f"Ambiguous — {raw_assignee.strip()!r} matches "
+                    f"Ambiguous — {rest!r} matches "
                     f"{len(assignee_ids)} collaborators, use their full Todoist name",
                 )
-                return
+                return None
             collaborator_id = assignee_ids[0]
             # Todoist-side casing wins for the stored/displayed name (a
             # candidate may be a casefolded mention key or the typed
@@ -1295,144 +1320,82 @@ def build_application(
             assignee_name = await todoist.collaborator_name(project.id, collaborator_id)
             if assignee_name is None:
                 assignee_name = candidates[0]
-            try:
-                await todoist.update_task_assignee(ok.task_id, collaborator_id)
-            except TodoistError as exc:
-                await _respond(
-                    update,
-                    "hard",
-                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
-                )
-                return
-            applied = commit(
-                context.chat_data,
-                user.id,
-                cfg.today(),
-                ok.task_id,
-                Assign(assignee=assignee_name),
-            )
-            # Unreachable in practice: sequential updates under the
-            # chat lock keep the phase stable between begin and commit.
-            assert isinstance(applied, Applied)
-            logger.debug(
-                "cmd_assign task=%s collaborator=%s: assigned, updated %d list(s)",
-                ok.task_id,
-                collaborator_id,
-                len(applied.touched),
-            )
-            await _edit_lists(
-                update,
-                context,
-                applied.touched,
-                mentions,
-                get_tasks(context.chat_data),
-            )
+            await todoist.update_task_assignee(ok.task_id, collaborator_id)
             # _assignee_suffix is a line suffix (" — @handle"); the
             # confirmation already draws its own arrow separator.
             mention = _assignee_suffix(assignee_name, mentions).removeprefix(" — ")
-            await _respond(
-                update,
-                "ok",
-                f"👤 {_render_text(ok.item.text)} → {mention}",
-                html=True,
+            return _Outcome(
+                event=Assign(assignee=assignee_name),
+                success=f"👤 {_render_text(ok.item.text)} → {mention}",
+                log_extra=collaborator_id,
             )
 
-    async def cmd_due(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat is None or user is None:
-            return
-        raw = " ".join(context.args or []).strip()
-        query, separator, raw_when = raw.partition(" ")
-        if not separator or not raw_when.strip():
-            await _respond(
-                update,
-                "soft",
+        def log_applied(
+            self, ok: Permitted, applied: Applied, outcome: _Outcome
+        ) -> None:
+            logger.debug(
+                "%s task=%s collaborator=%s: assigned, updated %d list(s)",
+                self.log_name,
+                ok.task_id,
+                outcome.log_extra,
+                len(applied.touched),
+            )
+
+    class DueCommand(_ListAction):
+        log_name = "cmd_due"
+
+        def usage(self) -> str:
+            return (
                 "Usage: /due <id> <when> — e.g. /due 5c tomorrow 5pm, "
-                "/due 5c next monday or /due 5c no date",
+                "/due 5c next monday or /due 5c no date"
             )
-            return
-        async with _chat_lock(chat.id):
-            if await _require_lists(update, context, user.id) is None:
-                return
-            folded = query.casefold()
+
+        def begin_event(self, rest: str) -> Reschedule:
             # begin validates the event's type only; the server-parsed
-            # date and recurring flag are carried by commit below.
-            outcome = begin(
-                context.chat_data,
-                user.id,
-                cfg.today(),
-                folded,
-                Reschedule(due=None, recurring=False),
-            )
-            match outcome:
-                case Unresolved() | Ambiguous() as fail:
-                    await _reply_begin_failure(update, fail, "cmd_due")
-                    return
-                case Rejected() as rej:
-                    logger.debug("cmd_due task=%s: already done, refusing", rej.task_id)
-                    await _respond(
-                        update, "soft", "Already completed — can't reschedule"
-                    )
-                    return
-                case Permitted() as ok:
-                    pass
-            when = raw_when.strip()
-            if len(when) > 150:
+            # date and recurring flag are carried by perform's result.
+            return Reschedule(due=None, recurring=False)
+
+        def rejected_reply(self, rej: Rejected) -> str:
+            return "Already completed — can't reschedule"
+
+        def rejected_debug(self, rej: Rejected) -> str | None:
+            return "already done, refusing"
+
+        async def perform(
+            self, update: Update, ok: Permitted, rest: str
+        ) -> _Outcome | None:
+            if len(rest) > 150:
                 # Reject rather than truncate: a cut natural-language
                 # string can parse to a valid but *different* date.
                 await _respond(
                     update, "soft", "Date string too long — max 150 characters"
                 )
-                return
+                return None
             # Todoist's server-side parser resolves the string (same
             # parser as quick-add); garbled input comes back as a
-            # TodoistError below.
-            try:
-                updated = await todoist.update_task_due(ok.task_id, when)
-            except TodoistError as exc:
-                await _respond(
-                    update,
-                    "hard",
-                    f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
-                )
-                return
+            # TodoistError to the shell.
+            updated = await todoist.update_task_due(ok.task_id, rest)
             day = effective_day(updated.due, updated.deadline, cfg.resolved_timezone)
             is_recurring = bool(updated.due and updated.due.is_recurring)
             logger.debug(
                 "cmd_due task=%s: day=%s recurring=%s", ok.task_id, day, is_recurring
             )
-            applied = commit(
-                context.chat_data,
-                user.id,
-                cfg.today(),
-                ok.task_id,
-                Reschedule(due=day, recurring=is_recurring),
-            )
-            # Unreachable in practice: sequential updates under the
-            # chat lock keep the phase stable between begin and commit.
-            assert isinstance(applied, Applied)
-            await _edit_lists(
-                update,
-                context,
-                applied.touched,
-                mentions,
-                get_tasks(context.chat_data),
-            )
             if day is None:
-                await _respond(
-                    update,
-                    "ok",
-                    f"📅 {_render_text(ok.item.text)} → no date",
-                    html=True,
-                )
+                success = f"📅 {_render_text(ok.item.text)} → no date"
             else:
-                await _respond(
-                    update,
-                    "ok",
-                    f"📅 {_render_text(ok.item.text)} → {_fmt_due(day, cfg.today())}",
-                    html=True,
+                success = (
+                    f"📅 {_render_text(ok.item.text)} → {_fmt_due(day, cfg.today())}"
                 )
+            return _Outcome(
+                event=Reschedule(due=day, recurring=is_recurring), success=success
+            )
+
+        def log_applied(
+            self, ok: Permitted, applied: Applied, outcome: _Outcome
+        ) -> None:
+            # The day/recurring debug line fires in perform, pre-commit;
+            # cmd_due has no post-commit line.
+            pass
 
     async def cmd_mine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """The sender's own tasks: due, then upcoming, then undated."""
@@ -1601,19 +1564,19 @@ def build_application(
         CommandHandler("mine", guarded(cmd_mine, typing=True), filters=auth)
     )
     application.add_handler(
-        CommandHandler("done", guarded(cmd_done, typing=True), filters=auth)
+        CommandHandler("done", _action_handler(DoneCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("undo", guarded(cmd_undo, typing=True), filters=auth)
+        CommandHandler("undo", _action_handler(UndoCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("edit", guarded(cmd_edit, typing=True), filters=auth)
+        CommandHandler("edit", _action_handler(EditCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("assign", guarded(cmd_assign, typing=True), filters=auth)
+        CommandHandler("assign", _action_handler(AssignCommand()), filters=auth)
     )
     application.add_handler(
-        CommandHandler("due", guarded(cmd_due, typing=True), filters=auth)
+        CommandHandler("due", _action_handler(DueCommand()), filters=auth)
     )
     application.add_handler(
         CommandHandler("project", guarded(cmd_project), filters=auth)
