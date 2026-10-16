@@ -42,6 +42,7 @@ from .state import (
     assignee_name_candidates,
     begin,
     commit,
+    drop_locally_done,
     get_chat_list,
     get_tasks,
     put_tasks,
@@ -636,6 +637,11 @@ async def _send_morning_list(
     """
     chat_data = application.chat_data[chat_id]
     entities = await _build_entities(tasks, todoist, project_id)
+    # The fetch ran outside this lock (once per cycle, chat-independent);
+    # a /done that landed since then wins — neither revert its record
+    # nor re-render it as active in this message.
+    fresh = drop_locally_done(chat_data, entities.values())
+    entities = {task.task_id: task for task in fresh}
     put_tasks(chat_data, entities.values())
     chunks = _render_list_message(
         list(entities),

@@ -215,6 +215,28 @@ def prune_tasks(chat_data: MutableMapping[str, Any] | None) -> None:
         del tasks[task_id]
 
 
+def drop_locally_done(
+    chat_data: MutableMapping[str, Any] | None, entities: Iterable[Task]
+) -> list[Task]:
+    """Filter out entities this chat has already completed locally.
+
+    The morning cycle fetches once per cycle outside every chat lock
+    (see _send_morning_list); a /done that lands between that fetch
+    and this chat's turn must not be reverted by the later put_tasks
+    nor re-rendered as active.  `done=True` is the only unambiguous
+    "local is newer" signal — it is set solely after a successful API
+    close, and a recurring roll gets a fresh task id.
+    """
+    tasks = get_tasks(chat_data)
+    out: list[Task] = []
+    for entity in entities:
+        stored = tasks.get(entity.task_id)
+        if stored is not None and stored.done:
+            continue
+        out.append(entity)
+    return out
+
+
 def get_chat_list(
     chat_data: MutableMapping[str, Any] | None,
 ) -> TaskList | None:

@@ -24,6 +24,7 @@ from iwcb_bot.state import (
     begin,
     commit,
     displayed_matches,
+    drop_locally_done,
     get_chat_list,
     get_mine_lists,
     get_tasks,
@@ -340,6 +341,30 @@ class TestTaskMap:
         set_chat_list(data, _tasklist(ids=["ab"]))
         # "ab" was never put, "zz" is unreferenced: prune kept nothing.
         assert get_tasks(data) == {}
+
+
+class TestDropLocallyDone:
+    def test_empty_map_keeps_all(self) -> None:
+        fetched = [_task("ab"), _task("cd")]
+        assert drop_locally_done({}, fetched) == fetched
+
+    def test_none_chat_data_keeps_all(self) -> None:
+        fetched = [_task("ab")]
+        assert drop_locally_done(None, fetched) == fetched
+
+    def test_drops_locally_done(self) -> None:
+        data = _chat_data(tasks=[_task("ab", done=True)])
+        assert drop_locally_done(data, [_task("ab"), _task("cd")]) == [_task("cd")]
+
+    def test_keeps_active_and_unseen(self) -> None:
+        # done=False stays (still due); an id the map has never seen
+        # (first cycle / foreign fetch) also stays.
+        data = _chat_data(tasks=[_task("ab", done=False)])
+        fetched = [_task("ab"), _task("zz")]
+        assert drop_locally_done(data, fetched) == fetched
+
+    def test_empty_batch(self) -> None:
+        assert drop_locally_done(_chat_data(tasks=[_task("ab")]), []) == []
 
 
 class TestListsDisplaying:

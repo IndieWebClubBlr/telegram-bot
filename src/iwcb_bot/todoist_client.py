@@ -284,29 +284,47 @@ class TodoistClient:
                 "move_task", self._api.move_task(task.id, project_id=project.id)
             )
         except TodoistError as exc:
-            # Don't leave a stray Inbox task behind a reported failure:
-            # roll back best-effort, then surface the original error.
-            try:
-                removed = await self._run("delete_task", self._api.delete_task(task.id))
-            except TodoistError:
-                removed = False
-            if not removed:
-                logger.warning(
-                    "task %s was created in Inbox and could not be moved "
-                    "or removed (move error: %s)",
-                    task.id,
-                    exc,
-                )
-                raise TodoistError(
-                    f"task was created in Inbox but could not be moved or "
-                    f"removed — move it manually (Todoist id {task.id})"
-                ) from exc
+            await self._rollback_inbox_task(task.id, exc)
             raise
         if not moved:
-            raise TodoistError("Todoist did not move the task into the project")
+            # The SDK documents a falsy return without an exception;
+            # same rollback duty as the raising path above.
+            exc = TodoistError("Todoist did not move the task into the project")
+            await self._rollback_inbox_task(task.id, exc)
+            raise exc
         # move_task returns only a success flag; re-fetch so callers see
         # the task in its real (moved) project.
-        return await self._run("get_task", self._api.get_task(task.id))
+        try:
+            return await self._run("get_task", self._api.get_task(task.id))
+        except TodoistError as exc:
+            raise TodoistError(
+                f"the task was created in the project but could not be "
+                f"re-fetched — check Todoist before adding again "
+                f"(Todoist id {task.id})"
+            ) from exc
+
+    async def _rollback_inbox_task(self, task_id: str, exc: TodoistError) -> None:
+        """Best-effort delete of a just-created Inbox task behind a move failure.
+
+        Raises the combined "created but could not be moved or removed"
+        error when the delete also fails (with a warning); otherwise
+        returns so the caller re-raises the original failure.
+        """
+        try:
+            removed = await self._run("delete_task", self._api.delete_task(task_id))
+        except TodoistError:
+            removed = False
+        if not removed:
+            logger.warning(
+                "task %s was created in Inbox and could not be moved "
+                "or removed (move error: %s)",
+                task_id,
+                exc,
+            )
+            raise TodoistError(
+                f"task was created in Inbox but could not be moved or "
+                f"removed — move it manually (Todoist id {task_id})"
+            ) from exc
 
     async def get_task(self, task_id: str) -> Task:
         return await self._run("get_task", self._api.get_task(task_id))
@@ -376,6 +394,18 @@ class TodoistClient:
                 (time.monotonic() - started) * 1000,
             )
             raise TodoistError("Could not reach the Todoist API") from exc
+        except Exception as exc:
+            # Like _pages, treat an unexpected SDK response shape as a
+            # TodoistError so the friendly "⚠ … — send /today or /mine
+            # to refresh" path handles it, and startup's resolve_project
+            # failure stays a clean "Startup error" instead of a
+            # traceback.
+            logger.debug(
+                "todoist %s failed in %.0fms: unexpected response",
+                label,
+                (time.monotonic() - started) * 1000,
+            )
+            raise TodoistError("Unexpected Todoist API response") from exc
         logger.debug(
             "todoist %s ok in %.0fms", label, (time.monotonic() - started) * 1000
         )
