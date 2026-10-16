@@ -1,108 +1,60 @@
+"""Application wiring: lifecycle hooks, morning announce loop, and the
+command registrations.  Command behaviour lives in commands.py; Telegram
+output and list rendering live in messaging.py.
+"""
+
 from __future__ import annotations
 
 import asyncio
-import functools
-import html
 import logging
-from collections import defaultdict
-from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, tzinfo
-from typing import Any, ClassVar, Literal
 
-from markdown_it import MarkdownIt
-from telegram import Message, ReactionTypeEmoji, Update
-from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 from todoist_api_python.models import Project
 
-from .config import Config
-from .state import (
-    UNSET,
-    Ambiguous,
-    Applied,
-    Assign,
-    Complete,
-    Edit,
-    Event,
-    Permitted,
-    Rejected,
-    Reopen,
-    Reschedule,
-    Task,
-    TaskList,
-    Unresolved,
-    active_lists,
-    assignee_name_candidates,
-    begin,
-    commit,
-    drop_locally_done,
-    get_chat_list,
-    get_tasks,
-    put_tasks,
-    set_chat_list,
-    set_mine_list,
-    take_mine,
-    task_suffixes,
-    todoist_name_for_user,
+from .commands import (
+    AddCommand,
+    AssignCommand,
+    DoneCommand,
+    DueCommand,
+    EditCommand,
+    HelpCommand,
+    ListCommand,
+    MineCommand,
+    ProjectCommand,
+    UnknownCommand,
+    UndoCommand,
+    command_callback,
+    command_handler,
 )
-from .todoist_client import DueTask, TodoistClient, TodoistError, effective_day
+from .config import Config
+from .messaging import (
+    build_entities,
+    chat_lock,
+    is_group_chat_type,
+    mentions_lookup,
+    render_list_message,
+    respond_safely,
+    send_chunks,
+)
+from .state import TaskList, drop_locally_done, put_tasks, set_chat_list
+from .todoist_client import DueTask, TodoistClient, TodoistError
 
 logger = logging.getLogger(__name__)
 
-Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]]
-
-
-@dataclass(frozen=True)
-class _Outcome:
-    """perform()'s result: the state event to commit and the ok reply.
-
-    `log_extra` feeds command-specific bits in log_applied overrides
-    (e.g. /assign's collaborator id).
-    """
-
-    event: Event
-    success: str
-    log_extra: str | None = None
-
-
-_MESSAGE_LIMIT = 4000
-_TELEGRAM_LIMIT = 4096
-_DISPLAY_LIMIT = 500
-_BODY_LIMIT = 3500
-_TYPING_INTERVAL = 4.0
-_NBSP = "\N{NO-BREAK SPACE}"
-_LIST_CMDS = "/today, /tomorrow or /week"
 _MORNING_TITLE = "<b>Daily Task Reminder</b>"
-_MINE_TITLE = "<b>Your tasks</b>"
-_MINE_LIMIT = 10
-
-# Every read-modify-write of a chat's list state holds this chat's lock:
-# updates are processed sequentially, so the only concurrent writer is
-# the morning-announce loop.  Locks bind to the running event loop on
-# first use; the bot runs a single loop for its whole lifetime.
-_chat_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
-def _chat_lock(chat_id: int) -> asyncio.Lock:
-    return _chat_locks[chat_id]
-
-
-_md = MarkdownIt("gfm-like", {"html": False}).disable("image")
-# Telegram only accepts http(s) and tg links; markdown-it's default
-# validator would also emit mailto:, data: and relative hrefs.
-_md.validateLink = lambda url: url.startswith(("http://", "https://", "tg://"))
-
-
-def _next_announce(at: time, tz: tzinfo, now: datetime | None = None) -> datetime:
+def next_announce(at: time, tz: tzinfo, now: datetime | None = None) -> datetime:
     """The next `at` wall-clock occurrence in `tz`, strictly after `now`.
 
     Returns the target instant (not a delta): the caller sleeps the
@@ -122,481 +74,6 @@ def _next_announce(at: time, tz: tzinfo, now: datetime | None = None) -> datetim
     if target <= now:
         target += timedelta(days=1)
     return target
-
-
-_HELP = """\
-Commands (project: {project}):
-
-/add <text> — add a task, quick-add syntax: "buy milk tomorrow p1 @chore /regular +Abhinav"
-/today — tasks due today or overdue, each with a short id
-/tomorrow — tasks due by end of tomorrow
-/week — tasks due by end of the next 6 days
-/mine — your tasks (due, then upcoming, then undated; max 10)
-/done <id> — complete the task with that id (from the last shown list)
-/undo <id> — reopen a task completed via /done (not recurring)
-/edit <id> <new text> — edit the task with that id
-/assign <id> <assignee> — assign to a Telegram @handle or Todoist name
-/due <id> <when> — change when a task is due ("tomorrow 5pm", "no date")
-/project — link to this project in Todoist
-/start or /help — this message
-
-- ids are shown in lowercase and matched case-insensitively
-- {list_cmds} or /mine show lists that /done, /undo, /edit, /assign and /due act on; edits appear in those messages only — refresh to re-fetch
-- /done, /undo, /edit, /assign and /due sync across every user's /mine list and the chat list
-- /add refreshes the shown list when the new task falls inside its range
-""".replace("{list_cmds}", _LIST_CMDS)
-
-
-async def _start_typing(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> asyncio.Task[None] | None:
-    """Keep Telegram's "typing…" indicator alive while a command runs.
-
-    Telegram drops the action after ~5 seconds, so it must be re-sent;
-    failures (channels, rate limits) are logged and never disturb the
-    command itself.  In forum groups the action is pinned to the topic the
-    command came from so the status shows where the reply will land.
-    """
-    chat = update.effective_chat
-    if chat is None:
-        return None
-    message = update.effective_message
-    thread_id: int | None = None
-    if chat.is_forum:
-        # General-topic messages arrive without message_thread_id; Telegram
-        # uses 1 internally for the General topic.
-        thread_id = (message.message_thread_id if message else None) or 1
-
-    async def ticker() -> None:
-        while True:
-            try:
-                await context.bot.send_chat_action(
-                    chat_id=chat.id,
-                    action=ChatAction.TYPING,
-                    message_thread_id=thread_id,
-                )
-            except TelegramError as exc:
-                logger.debug("chat action failed: %s", exc)
-            await asyncio.sleep(_TYPING_INTERVAL)
-
-    # application.create_task (not asyncio.create_task) so shutdown
-    # waits for the ticker; the name aids debugging in task dumps.
-    return context.application.create_task(ticker(), name=f"typing:{chat.id}")
-
-
-async def _stop_typing(ticker: asyncio.Task[None] | None) -> None:
-    if ticker is None:
-        return
-    ticker.cancel()
-    with suppress(asyncio.CancelledError):
-        await ticker
-
-
-async def _reply(update: Update, text: str) -> None:
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(text)
-
-
-Status = Literal["ok", "soft", "hard"]
-
-_STATUS_EMOJI: dict[Status, str] = {"ok": "👍", "soft": "🤨", "hard": "👎"}
-
-
-def _status_emoji(status: Status) -> str:
-    """Reaction emoji for a response status — from Telegram's fixed
-    reaction set (REACTION_REPLIES): 👍 ok, 🤨 soft refusal, 👎 failure.
-    """
-    return _STATUS_EMOJI[status]
-
-
-async def _react(update: Update, status: Status) -> None:
-    """React on the command message; failures log and stay silent.
-
-    Reaction mode's contract (REACTION_REPLIES): no text fallback —
-    a chat that rejects the reaction gets no feedback at all.
-    """
-    message = update.effective_message
-    if message is None:
-        return
-    try:
-        await message.get_bot().set_message_reaction(
-            chat_id=message.chat_id,
-            message_id=message.id,
-            reaction=ReactionTypeEmoji(_status_emoji(status)),
-        )
-    except TelegramError as exc:
-        logger.debug("reaction failed chat=%s: %s", message.chat_id, exc)
-
-
-async def _reply_html(update: Update, text: str) -> None:
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-def _md_html(text: str) -> str:
-    # Collapsing whitespace first kills markdown hard breaks (`<br />`,
-    # which Telegram rejects) and keeps output on one line.
-    return _md.renderInline(" ".join(text.split()))
-
-
-def _render_text(raw: str) -> str:
-    """Markdown → Telegram HTML, capped so the message stays sendable.
-
-    Percent-encoding of URLs inside links can inflate a 500-char title
-    ~12x; plain html.escape is bounded at 6x, so fall back to it when
-    the rendered form grows too large.
-    """
-    clean = _one_line(raw)
-    out = _md_html(clean)
-    if len(out) > _BODY_LIMIT:
-        return html.escape(clean)
-    return out
-
-
-def _fmt_due(day: date, reference: date) -> str:
-    """`Tue 9 Jun`, or `Tue 9 Jun 25` when the year differs from the
-    reference (usually the day the list was built for). Near-today lists
-    stay compact; old overdue items and year-boundary ranges disambiguate.
-    """
-    formatted = f"{day.strftime('%a')} {day.day} {day.strftime('%b')}"
-    if day.year != reference.year:
-        formatted += f" {day.strftime('%y')}"
-    return formatted
-
-
-def _one_line(text: str, limit: int = _DISPLAY_LIMIT) -> str:
-    """Collapse to a single line and cap the length.
-
-    Single-line input guarantees every rendered line is a self-contained,
-    balanced HTML fragment, so chunking on newlines can never split a tag.
-    The cap keeps the worst case (escaped entities) under the chunk limit.
-    """
-    collapsed = " ".join(text.split())
-    if len(collapsed) > limit:
-        return collapsed[: limit - 1] + "…"
-    return collapsed
-
-
-def _is_divider_line(line: str) -> bool:
-    """A rendered /mine section header (`<b>…</b>` on its own line)."""
-    return line.startswith("<b>") and line.endswith("</b>")
-
-
-def _chunk(text: str) -> list[str]:
-    if len(text) <= _MESSAGE_LIMIT:
-        return [text]
-    chunks: list[str] = []
-    current = ""
-    for line in text.split("\n"):
-        if current and len(current) + 1 + len(line) > _MESSAGE_LIMIT:
-            # A section divider as the last line of a message would
-            # label the *next* message's tasks — pull it down with the
-            # first line of its section when that still fits.
-            last = current.rsplit("\n", 1)[-1]
-            head = current[: current.rfind("\n")] if "\n" in current else ""
-            if (
-                head
-                and _is_divider_line(last)
-                and len(last) + 1 + len(line) <= _MESSAGE_LIMIT
-            ):
-                chunks.append(head)
-                current = f"{last}\n{line}"
-            else:
-                chunks.append(current)
-                current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        chunks.append(current)
-    # _one_line keeps every line well under the limit; the assert guards
-    # against future render changes reintroducing oversized chunks.
-    assert all(len(chunk) <= _MESSAGE_LIMIT for chunk in chunks)
-    return chunks
-
-
-def _mentions_lookup(cfg: Config) -> dict[str, str]:
-    """Casefolded Todoist-name → Telegram mention target mapping."""
-    return {name.casefold(): target for name, target in cfg.assignee_mentions.items()}
-
-
-def _assignee_suffix(name: str | None, mentions: dict[str, str]) -> str:
-    """Line suffix for an assignee: mention, handle, or plain name.
-
-    mentions maps casefolded Todoist collaborator names to a Telegram
-    @handle (auto-linked by Telegram) or a numeric user id (rendered as
-    a clickable tg:// mention).  Unmapped names render as escaped plain
-    text so ownership stays visible; unassigned tasks get nothing.
-    """
-    if name is None:
-        return ""
-    target = mentions.get(name.casefold())
-    if target is None:
-        return f" — {html.escape(name)}"
-    if target.startswith("@"):
-        return f" — {target}"
-    return f' — <a href="tg://user?id={target}">{html.escape(name)}</a>'
-
-
-def _render_list(
-    items: list[Task],
-    today: date,
-    *,
-    show_dates: bool,
-    mentions: dict[str, str] | None = None,
-    dividers: dict[int, str] | None = None,
-) -> str:
-    """Render the task list body (no headline).
-
-    Pure over resolved entities: callers resolve list ids through the
-    chat's task map first (_resolve_entities), so this never sees the
-    storage.  With show_dates (used by /tomorrow, /week and /mine) every
-    line carries its due date so multi-day lists are readable; /today
-    only dates overdue lines.  Done items keep their date in multi-day
-    lists too — the strike-through already marks them.  Assignees
-    (resolved at fetch time) render between the task text and the due
-    suffix.  dividers maps an item index to a bold section header
-    printed above that line (/mine's Due/Upcoming/No date sections).
-    """
-    if mentions is None:
-        mentions = {}
-    suffixes = task_suffixes([item.task_id for item in items])
-    width = max((len(suffix) for suffix in suffixes), default=0)
-    lines: list[str] = []
-    for index, (suffix, item) in enumerate(zip(suffixes, items, strict=True)):
-        if dividers and index in dividers:
-            lines.append(f"<b>{dividers[index]}</b>")
-        overdue = item.due is not None and item.due < today and not item.done
-        marker = "⚠ " if overdue else ""
-        body = _render_text(item.text)
-        if item.done:
-            body = f"<s>{body}</s>"
-        padded = suffix.ljust(width, _NBSP)
-        line = (
-            f"<code>[{padded}]</code>  {marker}{body}"
-            f"{_assignee_suffix(item.assignee, mentions)}"
-        )
-        if item.due is not None and (show_dates or overdue):
-            line += f" — due {_fmt_due(item.due, today)}"
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def _resolve_entities(task_ids: list[str], tasks: dict[str, Task]) -> list[Task]:
-    """Entities for the list's id order (invariant: every id has one)."""
-    resolved: list[Task] = []
-    for task_id in task_ids:
-        entity = tasks.get(task_id)
-        assert entity is not None, f"list id {task_id} has no entity in the map"
-        resolved.append(entity)
-    return resolved
-
-
-async def _build_entities(
-    tasks: list[DueTask], todoist: TodoistClient, project_id: str
-) -> dict[str, Task]:
-    """Map of fetched task id → entity, resolving assignee display names.
-
-    Insertion order = fetch order, so list(dict) gives the id order to
-    store.  Assignee resolution goes through the client's cached
-    collaborator map (fetched once, refreshed on unknown ids) and never
-    raises — a failed lookup leaves the assignee blank.
-    """
-    entities: dict[str, Task] = {}
-    for task in tasks:
-        assignee: str | None = None
-        if task.task.assignee_id:
-            assignee = await todoist.collaborator_name(
-                project_id, task.task.assignee_id
-            )
-        entities[task.task.id] = Task(
-            task_id=task.task.id,
-            text=task.task.content,
-            due=task.due,
-            recurring=bool(task.task.due and task.task.due.is_recurring),
-            assignee=assignee,
-        )
-    return entities
-
-
-def _render_list_message(
-    task_ids: list[str],
-    tasks: dict[str, Task],
-    today: date,
-    mentions: dict[str, str],
-    *,
-    show_dates: bool,
-    cutoff: date | None = None,
-    headline: str | None = None,
-    dividers: dict[int, str] | None = None,
-) -> list[str]:
-    """Resolve the list's ids and render into sendable chunks.
-
-    cutoff (when given) prefixes the "Due by <date>:" header; /mine
-    passes None and uses dividers for its sections instead.  Returns []
-    for an empty list — the caller decides the empty reply.
-    """
-    if not task_ids:
-        return []
-    body = _render_list(
-        _resolve_entities(task_ids, tasks),
-        today,
-        show_dates=show_dates,
-        mentions=mentions,
-        dividers=dividers,
-    )
-    if cutoff is not None:
-        body = f"<b>Due by {_fmt_due(cutoff, today)}:</b>\n{body}"
-    if headline is not None:
-        body = f"{headline}\n\n{body}"
-    return _chunk(body)
-
-
-async def _send_chunks(
-    send: Callable[[str], Awaitable[Message]], chunks: list[str]
-) -> int | None:
-    """Send rendered chunks via `send`; message id when single-chunk.
-
-    Single-chunk lists get an editable message id; multi-chunk lists
-    stay un-edited (the first message alone would lose its siblings).
-    """
-    first = await send(chunks[0])
-    for chunk in chunks[1:]:
-        await send(chunk)
-    logger.debug("sent %d chunk(s), editable=%s", len(chunks), len(chunks) == 1)
-    return first.message_id if len(chunks) == 1 else None
-
-
-async def _send_list(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    tasks: list[DueTask],
-    today: date,
-    cutoff: date,
-    mentions: dict[str, str],
-    todoist: TodoistClient,
-    project_id: str,
-    headline: str | None = None,
-    *,
-    already_confirmed: bool = False,
-) -> None:
-    """Send the rendered list, optionally under an HTML headline line.
-
-    Stores the list so /done, /undo and /edit act on it: entities go
-    into the chat's task map first, then the id order points at them.
-    `already_confirmed` means the caller delivered the status line
-    another way (REACTION_REPLIES reaction) — skip the headline echo.
-    """
-    message = update.effective_message
-    if message is None:
-        return
-    show_dates = cutoff > today
-    entities = await _build_entities(tasks, todoist, project_id)
-    put_tasks(context.chat_data, entities.values())
-    chunks = _render_list_message(
-        list(entities),
-        entities,
-        today,
-        mentions,
-        show_dates=show_dates,
-        cutoff=cutoff,
-        headline=headline,
-    )
-    if not chunks:
-        set_chat_list(context.chat_data, None)
-        if headline is not None:
-            # Reaction mode already got its status line from cmd_add;
-            # don't also echo the headline.
-            if not already_confirmed:
-                await _reply_html(update, headline)
-        elif cutoff > today:
-            await _reply(update, f"Nothing due by {_fmt_due(cutoff, today)} 🎉")
-        else:
-            await _reply(update, "Nothing due today 🎉")
-        return
-    message_id = await _send_chunks(
-        lambda text: message.reply_text(text, parse_mode=ParseMode.HTML), chunks
-    )
-    set_chat_list(
-        context.chat_data,
-        TaskList(
-            message_id=message_id,
-            day=today,
-            cutoff=cutoff,
-            task_ids=list(entities),
-            headline=headline,
-            show_dates=show_dates,
-        ),
-    )
-
-
-async def _edit_list(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    task_list: TaskList,
-    mentions: dict[str, str],
-    tasks: dict[str, Task],
-) -> None:
-    """Re-render the stored list message from its state.
-
-    Renders with task_list.day — not the current clock — so a strike
-    applied just after midnight still draws against the day the list
-    was built for, and the message the user is looking at stays
-    consistent.  `tasks` is the chat's map; ids resolve through it.
-    """
-    if task_list.message_id is None:
-        return
-    chat = update.effective_chat
-    if chat is None:
-        return
-    today = task_list.day
-    rendered = _render_list(
-        _resolve_entities(task_list.task_ids, tasks),
-        today,
-        show_dates=task_list.show_dates or task_list.cutoff > today,
-        mentions=mentions,
-        dividers=task_list.dividers,
-    )
-    if task_list.cutoff > today:
-        rendered = f"<b>Due by {_fmt_due(task_list.cutoff, today)}:</b>\n{rendered}"
-    if task_list.headline is not None:
-        rendered = f"{task_list.headline}\n\n{rendered}"
-    if len(rendered) > _TELEGRAM_LIMIT:
-        logger.warning("rendered list is %d chars, skipping edit", len(rendered))
-        return
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat.id,
-            message_id=task_list.message_id,
-            text=rendered,
-            parse_mode=ParseMode.HTML,
-        )
-        logger.debug("edited list message chat=%s (%d chars)", chat.id, len(rendered))
-    except BadRequest as exc:
-        if "not modified" in str(exc):
-            logger.debug("list message already up to date")
-        elif "message to edit not found" in str(exc).casefold():
-            # User deleted the list message; stop editing it and stop
-            # spamming exception logs on every strike.
-            logger.debug("list message deleted; clearing edit target")
-            task_list.message_id = None
-        else:
-            logger.exception("could not edit list message")
-    except TelegramError:
-        logger.exception("could not edit list message")
-
-
-async def _edit_lists(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    task_lists: list[TaskList],
-    mentions: dict[str, str],
-    tasks: dict[str, Task],
-) -> None:
-    """Re-edit every message backing `task_lists` (chat list + /mine lists)."""
-    for task_list in task_lists:
-        await _edit_list(update, context, task_list, mentions, tasks)
 
 
 async def _send_morning_list(
@@ -623,14 +100,14 @@ async def _send_morning_list(
     yesterday's message stops updating.  Caller holds the chat lock.
     """
     chat_data = application.chat_data[chat_id]
-    entities = await _build_entities(tasks, todoist, project_id)
+    entities = await build_entities(tasks, todoist, project_id)
     # The fetch ran outside this lock (once per cycle, chat-independent);
     # a /done that landed since then wins — neither revert its record
     # nor re-render it as active in this message.
     fresh = drop_locally_done(chat_data, entities.values())
     entities = {task.task_id: task for task in fresh}
     put_tasks(chat_data, entities.values())
-    chunks = _render_list_message(
+    chunks = render_list_message(
         list(entities),
         entities,
         today,
@@ -648,7 +125,7 @@ async def _send_morning_list(
                 parse_mode=ParseMode.HTML,
             )
         return
-    message_id = await _send_chunks(
+    message_id = await send_chunks(
         lambda text: application.bot.send_message(
             chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
         ),
@@ -664,29 +141,6 @@ async def _send_morning_list(
             headline=_MORNING_TITLE,
             show_dates=cutoff > today,
         ),
-    )
-
-
-def _is_group_chat_type(kind: str) -> bool:
-    """True for the Telegram chat types the morning list targets.
-
-    Telegram reports "private", "group", "supergroup" or "channel"
-    (`ChatType.value`); only group chats get the daily list — private
-    chats and channels do not.
-    """
-    return kind in {"group", "supergroup"}
-
-
-def _reaction_mode_applies(reaction_replies: bool, chat_type: str | None) -> bool:
-    """Whether REACTION_REPLIES answers this chat with a reaction.
-
-    Reaction mode is a group-chat feature: private chats, channels and
-    chats without a resolvable type always get the text reply.
-    `chat_type` is `Chat.type` — annotated `str`, actually ChatType (a
-    str-enum), which compares equal to "group"/"supergroup".
-    """
-    return bool(
-        reaction_replies and chat_type is not None and _is_group_chat_type(chat_type)
     )
 
 
@@ -712,11 +166,11 @@ async def _morning_loop(
     if at is None:
         return
     tz = cfg.resolved_timezone
-    mentions = _mentions_lookup(cfg)
+    mentions = mentions_lookup(cfg)
     chat_types: dict[int, str] = {}
     logger.info("morning list scheduled daily at %s (%s)", at.strftime("%H:%M"), tz)
     while True:
-        target = _next_announce(at, tz)
+        target = next_announce(at, tz)
         await asyncio.sleep(max(0.0, target.timestamp() - datetime.now(tz).timestamp()))
         try:
             today = cfg.today()
@@ -746,9 +200,9 @@ async def _morning_loop(
                         continue
                     kind = resolved.type.value
                     chat_types[chat_id] = kind
-                if not _is_group_chat_type(kind):
+                if not is_group_chat_type(kind):
                     continue
-                async with _chat_lock(chat_id):
+                async with chat_lock(chat_id):
                     try:
                         if tasks is None:
                             logger.debug(
@@ -795,797 +249,6 @@ def build_application(
     auth = (
         filters.Chat(chat_id=sorted(cfg.allowed_chat_ids)) & ~filters.UpdateType.EDITED
     )
-    mentions = _mentions_lookup(cfg)
-
-    def _should_react(update: Update) -> bool:
-        chat = update.effective_chat
-        return _reaction_mode_applies(
-            cfg.reaction_replies, chat.type if chat is not None else None
-        )
-
-    async def _respond(
-        update: Update, status: Status, text: str, *, html: bool = False
-    ) -> None:
-        """Action-command feedback: status reaction or the text reply.
-
-        With _should_react the command message gets 👍/🤨/👎 (see
-        _status_emoji) and nothing is posted; a failed reaction logs at
-        DEBUG and stays silent — no text fallback.  Otherwise the
-        reply strings are byte-identical to pre-reaction mode.
-        """
-        if _should_react(update):
-            await _react(update, status)
-            return
-        if html:
-            await _reply_html(update, text)
-        else:
-            await _reply(update, text)
-
-    async def _respond_safely(update: Update, status: Status, text: str) -> None:
-        try:
-            await _respond(update, status, text)
-        except TelegramError:
-            logger.exception("could not send reply")
-
-    async def _reply_begin_failure(
-        update: Update, outcome: Unresolved | Ambiguous, log_name: str
-    ) -> None:
-        """Reply for begin's two resolve failures (old _require_unique_id,
-        verbatim log shapes and reply strings).
-
-        The decision itself is state.begin (pure, tested) — this adds only
-        the log line and the reply.
-        """
-        if isinstance(outcome, Unresolved):
-            logger.debug("%s: no match (%d state(s))", log_name, outcome.list_count)
-            await _respond(update, "soft", "No match in the last shown list")
-            return
-        logger.debug("%s: ambiguous, %d matches", log_name, outcome.count)
-        await _respond(
-            update,
-            "soft",
-            f"Ambiguous — matches {outcome.count} tasks, be more specific",
-        )
-
-    def guarded(handler: Handler, *, typing: bool = False) -> Handler:
-        @functools.wraps(handler)
-        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            started = asyncio.get_running_loop().time()
-            chat = update.effective_chat
-            user = update.effective_user
-            # Ids only — never usernames, chat titles, message text or
-            # command arguments.
-            logger.debug(
-                "%s chat=%s user=%s",
-                handler.__name__,
-                chat.id if chat else None,
-                user.id if user else None,
-            )
-            ticker: asyncio.Task[None] | None = None
-            try:
-                if typing:
-                    ticker = await _start_typing(update, context)
-                await handler(update, context)
-                logger.debug(
-                    "%s done in %.0fms",
-                    handler.__name__,
-                    (asyncio.get_running_loop().time() - started) * 1000,
-                )
-            except TodoistError as exc:
-                logger.warning("%s failed: %s", handler.__name__, exc)
-                await _respond_safely(update, "hard", f"⚠ {exc}")
-            except TelegramError:
-                logger.exception("Telegram error in %s", handler.__name__)
-                await _respond_safely(
-                    update,
-                    "hard",
-                    f"⚠ Telegram send failed — the command may have "
-                    f"completed; check with {_LIST_CMDS} or /mine",
-                )
-            except Exception:
-                logger.exception("Unhandled error in %s", handler.__name__)
-                await _respond_safely(update, "hard", "Unexpected error")
-            finally:
-                await _stop_typing(ticker)
-
-        return wrapper
-
-    class _Command:
-        """Uniform shell for command handlers: guards, optional chat
-        lock, and registration.  Subclasses implement run(); the
-        ClassVars below pick the preamble:
-
-        - require_message / require_user: early-return unless present
-        - use_lock: wrap run() in the per-chat lock (commands that
-          need checks outside the lock set this False and take it
-          themselves inside run)
-        - typing: passed to guarded()
-
-        run() receives the raw update/context; derive chat/user inside
-        as needed.  Keep run bodies a linear sequence of awaits on the
-        closed-over helpers (cfg, todoist, _respond, ...) so they can
-        later be reified as effect descriptions for a pure
-        interpreter — this base holds no effects of its own.
-
-        Defined inside build_application; subclasses close over cfg,
-        todoist, project, mentions and the _respond/_send helpers.
-        """
-
-        log_name: str
-        require_message: ClassVar[bool] = False
-        require_user: ClassVar[bool] = False
-        use_lock: ClassVar[bool] = True
-        typing: ClassVar[bool] = True
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            raise NotImplementedError
-
-    def _command_handler(command: _Command) -> Handler:
-        """Guarded PTB handler for a _Command instance."""
-
-        async def cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            if command.require_message and update.effective_message is None:
-                return
-            if command.require_user and update.effective_user is None:
-                return
-            chat = update.effective_chat
-            if command.use_lock:
-                if chat is None:
-                    return
-                async with _chat_lock(chat.id):
-                    await command.run(update, context)
-            else:
-                await command.run(update, context)
-
-        cmd.__name__ = command.log_name
-        return guarded(cmd, typing=command.typing)
-
-    class HelpCommand(_Command):
-        """The /help and /start reply — no lock, no typing indicator."""
-
-        log_name = "cmd_help"
-        require_message = True
-        use_lock = False
-        typing = False
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            await _reply(update, _HELP.format(project=project.name))
-
-    class AddCommand(_Command):
-        """Quick-add: validates, then locks, adds, and confirms.
-
-        use_lock is False so the usage/too-long replies happen outside
-        the chat lock, as they always have.
-        """
-
-        log_name = "cmd_add"
-        require_message = False
-        use_lock = False
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            chat = update.effective_chat
-            if chat is None:
-                return
-            text = " ".join(context.args or []).strip()
-            if not text:
-                await _respond(
-                    update,
-                    "soft",
-                    "Usage: /add <task text> — e.g. /add buy milk tomorrow p1",
-                )
-                return
-            if len(text) > 500:
-                await _respond(
-                    update, "soft", "Task text too long — max 500 characters"
-                )
-                return
-            async with _chat_lock(chat.id):
-                task = await todoist.add_task_in_project(text, project)
-                today = cfg.today()
-                day = effective_day(task.due, task.deadline, cfg.resolved_timezone)
-                detail = f" (due {_fmt_due(day, today)})" if day is not None else ""
-                headline = f"✅ Added: {_render_text(task.content)}{detail}"
-                task_list = get_chat_list(context.chat_data)
-                if task_list is not None and task_list.day != today:
-                    task_list = None
-                cutoff = task_list.cutoff if task_list is not None else today
-                if day is None or day > cutoff:
-                    await _respond(update, "ok", headline, html=True)
-                    return
-                try:
-                    tasks = await todoist.tasks_due_by(project.id, cutoff)
-                except TodoistError:
-                    # The add itself succeeded — report it; only the list
-                    # refresh failed.
-                    await _respond(
-                        update,
-                        "ok",
-                        f"{headline}\n\n⚠ couldn't refresh the list — {_LIST_CMDS}",
-                        html=True,
-                    )
-                    return
-                # "Will react", not "did react": if Telegram then rejects
-                # the reaction the headline echo stays suppressed too —
-                # zero status is the mandated no-fallback contract.
-                confirmed = _should_react(update)
-                await _send_list(
-                    update,
-                    context,
-                    tasks,
-                    today,
-                    cutoff,
-                    mentions,
-                    todoist,
-                    project.id,
-                    headline=headline,
-                    already_confirmed=confirmed,
-                )
-                if confirmed:
-                    # The list above is content and still goes out; the
-                    # reaction is the action's status line.
-                    await _react(update, "ok")
-
-    class ListCommand(_Command):
-        """One of /today, /tomorrow, /week — fetch and show a list."""
-
-        def __init__(self, days: int, name: str) -> None:
-            self.days = days
-            self.log_name = name
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            today = cfg.today()
-            cutoff = today + timedelta(days=self.days)
-            tasks = await todoist.tasks_due_by(project.id, cutoff)
-            await _send_list(
-                update,
-                context,
-                tasks,
-                today,
-                cutoff,
-                mentions,
-                todoist,
-                project.id,
-            )
-
-    async def _require_lists(
-        update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
-    ) -> list[TaskList] | None:
-        """Today's lists for this user (their /mine + the chat list).
-
-        Callers hold the chat lock.  Returns None after replying why
-        there is nothing to act on.
-        """
-        today = cfg.today()
-        lists = active_lists(context.chat_data, user_id, today)
-        if lists:
-            return lists
-        if get_chat_list(context.chat_data) is not None:
-            # active_lists pruned stale /mine lists; a stale chat list
-            # is cleared here so the message explains the expiry once.
-            set_chat_list(context.chat_data, None)
-            await _respond(
-                update,
-                "soft",
-                f"The last list is from a previous day — send {_LIST_CMDS} " "or /mine",
-            )
-        else:
-            await _respond(update, "soft", f"Send {_LIST_CMDS} or /mine first")
-        return None
-
-    class _ListAction(_Command):
-        """A list-mutating command backed by the begin/commit FSM.
-
-        run() owns the shared FSM shell — arg split, chat lock, require
-        lists, begin, perform, commit, list re-edit, ok reply — so a
-        subclass supplies only its distinct pieces: usage text, the
-        begin event, the rejected reply, and the perform() mutation.
-        The optional hooks (split, validate,
-        rejected_debug, applied_verb, log_applied) have working
-        defaults; add a mutating command by subclassing here — set
-        log_name, implement usage/begin_event/rejected_reply/perform —
-        and registering _command_handler(MyCommand()).
-
-        use_lock is False on purpose: the shell takes the chat lock
-        itself, after the pre-lock split/validate replies.
-
-        Defined inside build_application so methods close over cfg,
-        todoist, project, mentions and the _respond/_edit_lists
-        helpers.
-        """
-
-        require_user = True
-        use_lock = False
-
-        def usage(self) -> str:
-            raise NotImplementedError
-
-        def begin_event(self, rest: str) -> Event:
-            raise NotImplementedError
-
-        def rejected_reply(self, rej: Rejected) -> str:
-            raise NotImplementedError
-
-        async def perform(
-            self, update: Update, ok: Permitted, rest: str
-        ) -> _Outcome | None:
-            """Mutate Todoist and build the commit event + ok reply.
-
-            Return None only after replying the abort yourself (the
-            shell stops without committing).  TodoistError propagates:
-            the shell replies the shared hard-failure line.
-            """
-            raise NotImplementedError
-
-        def split(self, raw: str) -> tuple[str, str] | None:
-            """(query, rest) for begin/perform — base splits `<id> <rest>`."""
-            query, separator, rest = raw.partition(" ")
-            if not separator or not rest.strip():
-                return None
-            return query, rest.strip()
-
-        def validate(self, rest: str) -> str | None:
-            """Pre-lock check; return a soft-reply text to abort with."""
-            return None
-
-        def rejected_debug(self, rej: Rejected) -> str | None:
-            return None
-
-        def applied_verb(self) -> str:
-            return "applied"
-
-        def log_applied(
-            self, ok: Permitted, applied: Applied, outcome: _Outcome
-        ) -> None:
-            logger.debug(
-                "%s task=%s: %s, updated %d displaying list(s)",
-                self.log_name,
-                ok.task_id,
-                self.applied_verb(),
-                len(applied.touched),
-            )
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            """Shared shell for _ListAction commands — see the class doc."""
-            chat = update.effective_chat
-            user = update.effective_user
-            if chat is None or user is None:
-                return
-            parts = self.split(" ".join(context.args or []).strip())
-            if parts is None:
-                await _respond(update, "soft", self.usage())
-                return
-            query, rest = parts
-            too_long = self.validate(rest)
-            if too_long is not None:
-                await _respond(update, "soft", too_long)
-                return
-            async with _chat_lock(chat.id):
-                if await _require_lists(update, context, user.id) is None:
-                    return
-                outcome = begin(
-                    context.chat_data,
-                    user.id,
-                    cfg.today(),
-                    query.casefold(),
-                    self.begin_event(rest),
-                )
-                match outcome:
-                    case Unresolved() | Ambiguous() as fail:
-                        await _reply_begin_failure(update, fail, self.log_name)
-                        return
-                    case Rejected() as rej:
-                        debug = self.rejected_debug(rej)
-                        if debug is not None:
-                            logger.debug(
-                                "%s task=%s: %s", self.log_name, rej.task_id, debug
-                            )
-                        await _respond(update, "soft", self.rejected_reply(rej))
-                        return
-                    case Permitted() as ok:
-                        pass
-                try:
-                    result = await self.perform(update, ok, rest)
-                except TodoistError as exc:
-                    await _respond(
-                        update,
-                        "hard",
-                        f"⚠ {exc} — send {_LIST_CMDS} or /mine to refresh",
-                    )
-                    return
-                if result is None:
-                    return
-                applied = commit(
-                    context.chat_data, user.id, cfg.today(), ok.task_id, result.event
-                )
-                # Unreachable in practice: sequential updates under the
-                # chat lock keep the phase stable between begin and commit.
-                assert isinstance(applied, Applied)
-                self.log_applied(ok, applied, result)
-                await _edit_lists(
-                    update,
-                    context,
-                    applied.touched,
-                    mentions,
-                    get_tasks(context.chat_data),
-                )
-                await _respond(update, "ok", result.success, html=True)
-
-    class DoneCommand(_ListAction):
-        log_name = "cmd_done"
-
-        def usage(self) -> str:
-            return f"Usage: /done <id> — id shown by {_LIST_CMDS} or /mine"
-
-        def split(self, raw: str) -> tuple[str, str] | None:
-            return (raw, "") if raw else None
-
-        def begin_event(self, rest: str) -> Complete:
-            return Complete()
-
-        def rejected_reply(self, rej: Rejected) -> str:
-            return f"Already completed — send {_LIST_CMDS} to refresh"
-
-        def rejected_debug(self, rej: Rejected) -> str | None:
-            return "already done"
-
-        async def perform(self, update: Update, ok: Permitted, rest: str) -> _Outcome:
-            await todoist.complete_task(ok.task_id)
-            next_due: date | None = None
-            if ok.item.recurring:
-                try:
-                    rolled = await todoist.get_task(ok.task_id)
-                    if rolled.due is not None:
-                        day = rolled.due.date
-                        next_due = day.date() if isinstance(day, datetime) else day
-                except TodoistError:
-                    logger.warning("could not read next occurrence of %s", ok.task_id)
-            # Commit the strike once (done + the rolled occurrence's
-            # date for recurring tasks), then re-edit every list
-            # displaying it.  Complete's due sentinel: UNSET leaves the
-            # date alone — a bare done must not clear the line — while a
-            # rolled recurring date replaces it.
-            event = Complete(due=next_due if next_due is not None else UNSET)
-            if ok.item.recurring and next_due is not None:
-                return _Outcome(
-                    event=event,
-                    success=(
-                        f"✅ {_render_text(ok.item.text)} — "
-                        f"next occurrence: {_fmt_due(next_due, cfg.today())}"
-                    ),
-                )
-            return _Outcome(event=event, success=f"✅ {_render_text(ok.item.text)}")
-
-        def applied_verb(self) -> str:
-            return "completed"
-
-    class UndoCommand(_ListAction):
-        log_name = "cmd_undo"
-
-        def usage(self) -> str:
-            return f"Usage: /undo <id> — id shown by {_LIST_CMDS} or /mine"
-
-        def split(self, raw: str) -> tuple[str, str] | None:
-            return (raw, "") if raw else None
-
-        def begin_event(self, rest: str) -> Reopen:
-            return Reopen()
-
-        def rejected_reply(self, rej: Rejected) -> str:
-            if rej.reason == "recurring":
-                # Blanket refusal: undoing a rolled completion is
-                # unsafe (the series already advanced); a series that
-                # *ended* on the last occurrence could be undone, but
-                # distinguishing the two needs extra state — accepted
-                # false negative.
-                return "⚠ can't undo a recurring completion"
-            return "Not completed — nothing to undo"
-
-        async def perform(self, update: Update, ok: Permitted, rest: str) -> _Outcome:
-            await todoist.uncomplete_task(ok.task_id)
-            return _Outcome(event=Reopen(), success=f"↩️ {_render_text(ok.item.text)}")
-
-        def applied_verb(self) -> str:
-            return "reopened"
-
-    class EditCommand(_ListAction):
-        log_name = "cmd_edit"
-
-        def usage(self) -> str:
-            return "Usage: /edit <id> <new text> — e.g. /edit 5c buy milk"
-
-        def validate(self, rest: str) -> str | None:
-            if len(rest) > 500:
-                return "Task text too long — max 500 characters"
-            return None
-
-        def begin_event(self, rest: str) -> Edit:
-            return Edit(text=rest)
-
-        def rejected_reply(self, rej: Rejected) -> str:
-            return "Already completed — can't edit"
-
-        def rejected_debug(self, rej: Rejected) -> str | None:
-            return "already done, refusing"
-
-        async def perform(self, update: Update, ok: Permitted, rest: str) -> _Outcome:
-            await todoist.update_task_content(ok.task_id, rest)
-            return _Outcome(event=Edit(text=rest), success=f"✏️ {_render_text(rest)}")
-
-        def applied_verb(self) -> str:
-            return "renamed"
-
-    class AssignCommand(_ListAction):
-        log_name = "cmd_assign"
-
-        def usage(self) -> str:
-            return (
-                "Usage: /assign <id> <assignee> — e.g. /assign 5c @abnv "
-                "or /assign 5c Priya Singh"
-            )
-
-        def begin_event(self, rest: str) -> Assign:
-            # begin validates the event's type only; the Todoist-canonical
-            # assignee name is resolved in perform and carried by commit.
-            return Assign(assignee=rest.strip())
-
-        def rejected_reply(self, rej: Rejected) -> str:
-            return "Already completed — can't assign"
-
-        def rejected_debug(self, rej: Rejected) -> str | None:
-            return "already done, refusing"
-
-        async def perform(
-            self, update: Update, ok: Permitted, rest: str
-        ) -> _Outcome | None:
-            # Raw mapping (original casing) — `mentions` here is the
-            # casefolded render lookup and would store lowercase names.
-            candidates = assignee_name_candidates(rest, cfg.assignee_mentions)
-            # Resolve every candidate name (a bare @handle can map to
-            # several Todoist names); genuine ambiguity is more than
-            # one distinct collaborator.
-            assignee_ids: list[str] = []
-            for candidate in candidates:
-                collaborator_id = await todoist.collaborator_id_for_name(
-                    project.id, candidate
-                )
-                if collaborator_id is not None and collaborator_id not in assignee_ids:
-                    assignee_ids.append(collaborator_id)
-            if not assignee_ids:
-                logger.debug(
-                    "cmd_assign task=%s: no collaborator for %d candidate(s)",
-                    ok.task_id,
-                    len(candidates),
-                )
-                await _respond(
-                    update,
-                    "soft",
-                    f"Todoist collaborator {rest!r} not found on "
-                    "this project (or the lookup failed) — check the name or "
-                    "ASSIGNEE_MENTIONS",
-                )
-                return None
-            if len(assignee_ids) > 1:
-                logger.debug(
-                    "cmd_assign task=%s: ambiguous assignee, %d collaborators",
-                    ok.task_id,
-                    len(assignee_ids),
-                )
-                await _respond(
-                    update,
-                    "soft",
-                    f"Ambiguous — {rest!r} matches "
-                    f"{len(assignee_ids)} collaborators, use their full Todoist name",
-                )
-                return None
-            collaborator_id = assignee_ids[0]
-            # Todoist-side casing wins for the stored/displayed name (a
-            # candidate may be a casefolded mention key or the typed
-            # spelling); the cache hit is guaranteed — the id was just
-            # resolved through it.
-            assignee_name = await todoist.collaborator_name(project.id, collaborator_id)
-            if assignee_name is None:
-                assignee_name = candidates[0]
-            await todoist.update_task_assignee(ok.task_id, collaborator_id)
-            # _assignee_suffix is a line suffix (" — @handle"); the
-            # confirmation already draws its own arrow separator.
-            mention = _assignee_suffix(assignee_name, mentions).removeprefix(" — ")
-            return _Outcome(
-                event=Assign(assignee=assignee_name),
-                success=f"👤 {_render_text(ok.item.text)} → {mention}",
-                log_extra=collaborator_id,
-            )
-
-        def log_applied(
-            self, ok: Permitted, applied: Applied, outcome: _Outcome
-        ) -> None:
-            logger.debug(
-                "%s task=%s collaborator=%s: assigned, updated %d list(s)",
-                self.log_name,
-                ok.task_id,
-                outcome.log_extra,
-                len(applied.touched),
-            )
-
-    class DueCommand(_ListAction):
-        log_name = "cmd_due"
-
-        def usage(self) -> str:
-            return (
-                "Usage: /due <id> <when> — e.g. /due 5c tomorrow 5pm, "
-                "/due 5c next monday or /due 5c no date"
-            )
-
-        def begin_event(self, rest: str) -> Reschedule:
-            # begin validates the event's type only; the server-parsed
-            # date and recurring flag are carried by perform's result.
-            return Reschedule(due=None, recurring=False)
-
-        def rejected_reply(self, rej: Rejected) -> str:
-            return "Already completed — can't reschedule"
-
-        def rejected_debug(self, rej: Rejected) -> str | None:
-            return "already done, refusing"
-
-        async def perform(
-            self, update: Update, ok: Permitted, rest: str
-        ) -> _Outcome | None:
-            if len(rest) > 150:
-                # Reject rather than truncate: a cut natural-language
-                # string can parse to a valid but *different* date.
-                await _respond(
-                    update, "soft", "Date string too long — max 150 characters"
-                )
-                return None
-            # Todoist's server-side parser resolves the string (same
-            # parser as quick-add); garbled input comes back as a
-            # TodoistError to the shell.
-            updated = await todoist.update_task_due(ok.task_id, rest)
-            day = effective_day(updated.due, updated.deadline, cfg.resolved_timezone)
-            is_recurring = bool(updated.due and updated.due.is_recurring)
-            logger.debug(
-                "cmd_due task=%s: day=%s recurring=%s", ok.task_id, day, is_recurring
-            )
-            if day is None:
-                success = f"📅 {_render_text(ok.item.text)} → no date"
-            else:
-                success = (
-                    f"📅 {_render_text(ok.item.text)} → {_fmt_due(day, cfg.today())}"
-                )
-            return _Outcome(
-                event=Reschedule(due=day, recurring=is_recurring), success=success
-            )
-
-        def log_applied(
-            self, ok: Permitted, applied: Applied, outcome: _Outcome
-        ) -> None:
-            # The day/recurring debug line fires in perform, pre-commit;
-            # cmd_due has no post-commit line.
-            pass
-
-    class MineCommand(_Command):
-        """The sender's own tasks: due, then upcoming, then undated."""
-
-        log_name = "cmd_mine"
-        require_message = True
-        require_user = True
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            chat = update.effective_chat
-            user = update.effective_user
-            message = update.effective_message
-            if chat is None or user is None or message is None:
-                return
-            assignee_name = todoist_name_for_user(
-                user.id, user.username, cfg.assignee_mentions
-            )
-            if assignee_name is None:
-                logger.debug("cmd_mine user=%s: no ASSIGNEE_MENTIONS mapping", user.id)
-                await _respond(
-                    update,
-                    "soft",
-                    "I can't match your Telegram account to a Todoist "
-                    "collaborator — set ASSIGNEE_MENTIONS "
-                    "(Todoist Name=@you or Name=<numeric id>) and retry",
-                )
-                return
-            assignee_id = await todoist.collaborator_id_for_name(
-                project.id, assignee_name
-            )
-            if assignee_id is None:
-                logger.debug(
-                    "cmd_mine user=%s: collaborator not in project cache", user.id
-                )
-                await _respond(
-                    update,
-                    "soft",
-                    f"Todoist collaborator {assignee_name!r} not found on this "
-                    "project (or the lookup failed) — check ASSIGNEE_MENTIONS "
-                    "and retry /mine",
-                )
-                return
-            today = cfg.today()
-            due, upcoming, undated = await todoist.tasks_for_assignee(
-                project.id, assignee_id, today
-            )
-            selected, dividers = take_mine(due, upcoming, undated, _MINE_LIMIT)
-            logger.debug(
-                "cmd_mine user=%s: due=%d upcoming=%d undated=%d selected=%d",
-                user.id,
-                len(due),
-                len(upcoming),
-                len(undated),
-                len(selected),
-            )
-            if not selected:
-                set_mine_list(context.chat_data, user.id, None)
-                await _reply(update, "Nothing assigned to you 🎉")
-                return
-            entities = await _build_entities(selected, todoist, project.id)
-            chunks = _render_list_message(
-                list(entities),
-                entities,
-                today,
-                mentions,
-                show_dates=True,
-                headline=_MINE_TITLE,
-                dividers=dividers,
-            )
-            message_id = await _send_chunks(
-                lambda text: message.reply_text(text, parse_mode=ParseMode.HTML),
-                chunks,
-            )
-            put_tasks(context.chat_data, entities.values())
-            set_mine_list(
-                context.chat_data,
-                user.id,
-                TaskList(
-                    message_id=message_id,
-                    day=today,
-                    cutoff=today,
-                    task_ids=list(entities),
-                    headline=_MINE_TITLE,
-                    show_dates=True,
-                    dividers=dividers,
-                ),
-            )
-
-    class ProjectCommand(_Command):
-        """A link to the configured project — no lock, no typing."""
-
-        log_name = "cmd_project"
-        require_message = True
-        use_lock = False
-        typing = False
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            message = update.effective_message
-            if message is None:
-                return
-            await message.reply_text(
-                f'📂 <a href="{html.escape(project.url, quote=True)}">'
-                f"{html.escape(project.name)}</a> — open in Todoist",
-                parse_mode=ParseMode.HTML,
-            )
-
-    class UnknownCommand(_Command):
-        """Soft 'unknown command' for anything unmatched — no lock."""
-
-        log_name = "on_unknown"
-        require_message = True
-        use_lock = False
-        typing = False
-
-        async def run(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            message = update.effective_message
-            text = message.text if message is not None else None
-            first = (text or "").split(maxsplit=1)[0] if text else ""
-            if "@" in first:
-                # /cmd@SomeOtherBot — another bot's command, stay quiet.
-                addressed = first.partition("@")[2].casefold()
-                if addressed != context.bot.username.casefold():
-                    return
-            await _respond(update, "soft", "Unknown command — try /help")
-
     morning_task: asyncio.Task[None] | None = None
 
     async def post_init(application: Application) -> None:
@@ -1621,7 +284,7 @@ def build_application(
     ) -> None:
         logger.error("Unhandled exception", exc_info=context.error)
         if isinstance(update, Update):
-            await _respond_safely(update, "hard", "Unexpected error")
+            await respond_safely(cfg, update, "hard", "Unexpected error")
 
     application = (
         Application.builder()
@@ -1632,49 +295,50 @@ def build_application(
         .build()
     )
     application.add_handler(
-        CommandHandler(["help", "start"], _command_handler(HelpCommand()), filters=auth)
+        command_handler(["help", "start"], HelpCommand(cfg, todoist, project), auth)
     )
     application.add_handler(
-        CommandHandler("add", _command_handler(AddCommand()), filters=auth)
+        command_handler("add", AddCommand(cfg, todoist, project), auth)
     )
     application.add_handler(
-        CommandHandler(
-            "today", _command_handler(ListCommand(0, "cmd_today")), filters=auth
+        command_handler(
+            "today", ListCommand(cfg, todoist, project, 0, "cmd_today"), auth
         )
     )
     application.add_handler(
-        CommandHandler(
-            "tomorrow", _command_handler(ListCommand(1, "cmd_tomorrow")), filters=auth
+        command_handler(
+            "tomorrow", ListCommand(cfg, todoist, project, 1, "cmd_tomorrow"), auth
         )
     )
     application.add_handler(
-        CommandHandler(
-            "week", _command_handler(ListCommand(6, "cmd_week")), filters=auth
+        command_handler("week", ListCommand(cfg, todoist, project, 6, "cmd_week"), auth)
+    )
+    application.add_handler(
+        command_handler("mine", MineCommand(cfg, todoist, project), auth)
+    )
+    application.add_handler(
+        command_handler("done", DoneCommand(cfg, todoist, project), auth)
+    )
+    application.add_handler(
+        command_handler("undo", UndoCommand(cfg, todoist, project), auth)
+    )
+    application.add_handler(
+        command_handler("edit", EditCommand(cfg, todoist, project), auth)
+    )
+    application.add_handler(
+        command_handler("assign", AssignCommand(cfg, todoist, project), auth)
+    )
+    application.add_handler(
+        command_handler("due", DueCommand(cfg, todoist, project), auth)
+    )
+    application.add_handler(
+        command_handler("project", ProjectCommand(cfg, todoist, project), auth)
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.COMMAND & auth,
+            command_callback(UnknownCommand(cfg, todoist, project)),
         )
-    )
-    application.add_handler(
-        CommandHandler("mine", _command_handler(MineCommand()), filters=auth)
-    )
-    application.add_handler(
-        CommandHandler("done", _command_handler(DoneCommand()), filters=auth)
-    )
-    application.add_handler(
-        CommandHandler("undo", _command_handler(UndoCommand()), filters=auth)
-    )
-    application.add_handler(
-        CommandHandler("edit", _command_handler(EditCommand()), filters=auth)
-    )
-    application.add_handler(
-        CommandHandler("assign", _command_handler(AssignCommand()), filters=auth)
-    )
-    application.add_handler(
-        CommandHandler("due", _command_handler(DueCommand()), filters=auth)
-    )
-    application.add_handler(
-        CommandHandler("project", _command_handler(ProjectCommand()), filters=auth)
-    )
-    application.add_handler(
-        MessageHandler(filters.COMMAND & auth, _command_handler(UnknownCommand()))
     )
     application.add_error_handler(on_error)
     return application

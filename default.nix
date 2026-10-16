@@ -44,7 +44,9 @@ py.buildPythonApplication {
   pythonImportsCheck = [
     "iwcb_bot"
     "iwcb_bot.bot"
+    "iwcb_bot.commands"
     "iwcb_bot.config"
+    "iwcb_bot.messaging"
     "iwcb_bot.state"
     "iwcb_bot.todoist_client"
   ];
