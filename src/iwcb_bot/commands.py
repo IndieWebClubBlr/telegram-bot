@@ -33,6 +33,7 @@ from .messaging import (
     MINE_LIMIT,
     MINE_TITLE,
     assignee_suffix,
+    bot_for_update,
     build_entities,
     chat_lock,
     edit_lists,
@@ -918,6 +919,6 @@ class UnknownCommand(_Command):
         if "@" in first:
             # /cmd@SomeOtherBot — another bot's command, stay quiet.
             addressed = first.partition("@")[2].casefold()
-            if addressed != context.bot.username.casefold():
+            if addressed != bot_for_update(update).username.casefold():
                 return
         await self._respond(update, "soft", "Unknown command — try /help")

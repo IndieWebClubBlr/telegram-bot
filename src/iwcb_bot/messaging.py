@@ -12,11 +12,12 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from datetime import date
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from markdown_it import MarkdownIt
 from telegram import Message, ReactionTypeEmoji, Update
@@ -48,6 +49,51 @@ NBSP = "\N{NO-BREAK SPACE}"
 LIST_CMDS = "/today, /tomorrow or /week"
 MINE_TITLE = "<b>Your tasks</b>"
 MINE_LIMIT = 10
+
+
+class TelegramBot(ABC):
+    """The send-side Telegram surface the bot actually uses.
+
+    The library's Bot implements this; bot_for_update() casts the bot
+    bound to an Update so tests can substitute a fake while the real
+    reply/render stack (Message.reply_text → bot.send_message) runs
+    unmodified.
+    """
+
+    @property
+    @abstractmethod
+    def username(self) -> str:
+        """The bot's own username, without the @."""
+
+    @abstractmethod
+    async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> Message:
+        """Send a message; the posted Message on success."""
+
+    @abstractmethod
+    async def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, **kwargs: Any
+    ) -> Any:
+        """Edit a previously sent message in place."""
+
+    @abstractmethod
+    async def set_message_reaction(
+        self, chat_id: int, message_id: int, reaction: Any, **kwargs: Any
+    ) -> bool:
+        """React to the command message with an emoji reaction."""
+
+    @abstractmethod
+    async def send_chat_action(self, chat_id: int, action: str, **kwargs: Any) -> bool:
+        """Show a chat action such as "typing…"."""
+
+
+def bot_for_update(update: Update) -> TelegramBot:
+    """The bot bound to this update — the library Bot in production, a
+    fake in tests.  The single extraction point: command code must never
+    reach for context.bot or construct a Bot, so binding a fake to the
+    update makes every send go to the fake.
+    """
+    return cast(TelegramBot, update.get_bot())
+
 
 # Every read-modify-write of a chat's list state holds this chat's lock:
 # updates are processed sequentially, so the only concurrent writer is
@@ -89,7 +135,7 @@ async def start_typing(
     async def ticker() -> None:
         while True:
             try:
-                await context.bot.send_chat_action(
+                await bot_for_update(update).send_chat_action(
                     chat_id=chat.id,
                     action=ChatAction.TYPING,
                     message_thread_id=thread_id,
@@ -139,7 +185,7 @@ async def react(update: Update, status: Status) -> None:
     if message is None:
         return
     try:
-        await message.get_bot().set_message_reaction(
+        await bot_for_update(update).set_message_reaction(
             chat_id=message.chat_id,
             message_id=message.id,
             reaction=ReactionTypeEmoji(status_emoji(status)),
@@ -485,7 +531,7 @@ async def _edit_list(
         logger.warning("rendered list is %d chars, skipping edit", len(rendered))
         return
     try:
-        await context.bot.edit_message_text(
+        await bot_for_update(update).edit_message_text(
             chat_id=chat.id,
             message_id=task_list.message_id,
             text=rendered,
