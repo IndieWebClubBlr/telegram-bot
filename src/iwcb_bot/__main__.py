@@ -8,7 +8,7 @@ from telegram.error import InvalidToken, TelegramError
 
 from .bot import build_application
 from .config import Config, ConfigError
-from .todoist_client import TodoistClient, TodoistError
+from .todoist_client import HttpTodoistClient, TodoistError
 
 
 def _redact(message: str, secrets: tuple[str, ...]) -> str:
@@ -89,7 +89,7 @@ def main() -> None:
     for handler in logging.getLogger().handlers:
         handler.addFilter(secret_filter)
 
-    todoist = TodoistClient(cfg.todoist_token, lambda: cfg.resolved_timezone)
+    todoist = HttpTodoistClient(cfg.todoist_token, lambda: cfg.resolved_timezone)
     try:
         project = asyncio.run(todoist.resolve_project(cfg.project_id))
     except ConfigError as exc:

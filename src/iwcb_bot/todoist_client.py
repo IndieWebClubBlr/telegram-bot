@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, tzinfo
@@ -73,7 +74,74 @@ def effective_day(
     return min(days) if days else None
 
 
-class TodoistClient:
+class TodoistClient(ABC):
+    """The Todoist operations the bot performs.
+
+    Commands, the morning loop and list rendering depend only on this
+    interface; HttpTodoistClient is the live implementation and tests
+    substitute a fake.  Everything is async for uniform call sites.
+    """
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Release underlying HTTP resources."""
+
+    @abstractmethod
+    async def warm_collaborators(self, project_id: str) -> None:
+        """Fetch the collaborator cache now, unless already cached."""
+
+    @abstractmethod
+    async def collaborator_name(self, project_id: str, assignee_id: str) -> str | None:
+        """Display name for a Todoist assignee id, or None if unresolvable."""
+
+    @abstractmethod
+    async def collaborator_id_for_name(self, project_id: str, name: str) -> str | None:
+        """Collaborator id whose name casefold-matches `name`, or None."""
+
+    @abstractmethod
+    async def resolve_project(self, project_id: str) -> Project:
+        """Load a project, or raise ConfigError/TodoistError."""
+
+    @abstractmethod
+    async def tasks_due_by(self, project_id: str, cutoff: date) -> list[DueTask]:
+        """Dated tasks due on or before `cutoff`, earliest day first."""
+
+    @abstractmethod
+    async def tasks_for_assignee(
+        self, project_id: str, assignee_id: str, today: date
+    ) -> tuple[list[DueTask], list[DueTask], list[DueTask]]:
+        """An assignee's tasks: (due by today, future, undated)."""
+
+    @abstractmethod
+    async def add_task_in_project(self, text: str, project: Project) -> Task:
+        """Create a task in `project`, or raise TodoistError."""
+
+    @abstractmethod
+    async def get_task(self, task_id: str) -> Task:
+        """Fetch one task by id."""
+
+    @abstractmethod
+    async def update_task_content(self, task_id: str, content: str) -> Task:
+        """Rename a task."""
+
+    @abstractmethod
+    async def update_task_assignee(self, task_id: str, assignee_id: str) -> Task:
+        """Assign a task to a collaborator (cannot clear an assignee)."""
+
+    @abstractmethod
+    async def update_task_due(self, task_id: str, due_string: str) -> Task:
+        """Reschedule from a natural-language string (server-parsed)."""
+
+    @abstractmethod
+    async def complete_task(self, task_id: str) -> None:
+        """Mark a task done."""
+
+    @abstractmethod
+    async def uncomplete_task(self, task_id: str) -> None:
+        """Reopen a completed task."""
+
+
+class HttpTodoistClient(TodoistClient):
     def __init__(self, token: str, timezone: Callable[[], tzinfo]) -> None:
         self._api = TodoistAPIAsync(token)
         # A callable, not a frozen value: when TIMEZONE is unset the
