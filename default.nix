@@ -19,6 +19,7 @@ py.buildPythonApplication {
   src = lib.cleanSourceWith {
     src = lib.sourceByRegex ./. [
       "^src(/.*)?$"
+      "^tests(/.*)?$"
       "^pyproject\\.toml$"
       "^README\\.md$"
       "^LICENSE$"
@@ -38,6 +39,13 @@ py.buildPythonApplication {
     py.todoist-api-python
     py.markdown-it-py
     py.linkify-it-py
+  ];
+
+  # Run the offline command suite in the build sandbox (no network; the
+  # tests' socket guard makes any accidental real call fail loudly).
+  nativeCheckInputs = [
+    py.pytest
+    py.pytestCheckHook
   ];
 
   pythonImportsCheck = [
