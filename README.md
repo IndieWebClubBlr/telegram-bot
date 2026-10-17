@@ -85,7 +85,7 @@ errors) — plus a few optional ones:
 | `MORNING_ANNOUNCE_TIME` | Optional wall-clock time (24h `HH:MM`, in the `TIMEZONE` zone) at which the bot proactively sends the day's task list to every allowed group chat (private chats are skipped). Defaults to `09:00`; set to `off` to disable. An invalid value aborts startup with exit code 2 |
 | `MORNING_ANNOUNCE_WHEN_EMPTY` | `true` (default) or `false` — whether the daily list is sent when nothing is due. `true` posts the title over "Nothing due today 🎉"; `false` stays silent and clears the chat's stored list so the previous day's message stops updating. Case-insensitive; an invalid value aborts startup with exit code 2 |
 | `REACTION_REPLIES` | `false` (default) or `true` — in group chats, action-command feedback (`/add`, `/done`, `/undo`, `/edit`, `/assign`, `/due`, unknown-command hints and `/mine`'s configuration hints) becomes a reaction on the command message instead of a text reply: 👍 success, 🤨 soft refusal (usage error, no match, already completed), 👎 failure (Todoist/API errors). One reaction per command, so an `/add` whose list refresh fails still gets only 👍 — the stale-list note has no channel in this mode. List messages (`/today`, `/tomorrow`, `/week`, `/mine`, `/help`, `/project`) are always sent as text, private chats always keep text replies, and a rejected reaction logs at `DEBUG` and stays silent — no text fallback. Case-insensitive; an invalid value aborts startup with exit code 2 |
-| `ASSIGNEE_MENTIONS` | Optional `;`-separated `Todoist Name=Telegram` pairs mapping shared-project assignee names to Telegram mentions — `Abhinav Nair=@abnv;Priya Singh=123456789`. Names match case-insensitively; mapped names render as clickable mentions, unmapped assignees as plain text, unassigned tasks show no suffix. Names and targets must each be unique (compared case-insensitively) — a duplicate aborts startup with exit code 2 |
+| `ASSIGNEE_MENTIONS` | Optional `;`-separated `Todoist Name=Telegram` pairs mapping shared-project assignee names to Telegram mentions — `Abhinav Nair=123456789;Priya Singh=@priya`. Names match case-insensitively; mapped names render as clickable mentions, unmapped assignees as plain text, unassigned tasks show no suffix. Names and targets must each be unique (compared case-insensitively) — a duplicate aborts startup with exit code 2. Prefer numeric ids where the mapping is used for identity (`/mine`): a Telegram `@handle` can be renamed and re-acquired by someone else |
 | `LOG_LEVEL` | Optional bot log level: `DEBUG`, `INFO`, `WARNING` or `ERROR` (case-insensitive). Defaults to `INFO`. `DEBUG` logs each command action and Todoist API call with durations, and includes numeric chat/user/task ids for correlation — it never logs names, usernames, chat titles, task text or command arguments. An invalid value aborts startup with exit code 2 |
 
 ## Assignees
@@ -98,8 +98,10 @@ list is fetched once on first need and cached; an unknown assignee id
 
 `/mine` also needs the reverse direction: the sending Telegram user is
 matched to their Todoist collaborator name through `ASSIGNEE_MENTIONS`
-(numeric user id first, then `@username`). A sender who is not mapped
-there gets a configuration hint instead of a list.
+(numeric user id first, then `@username`). Numeric ids are stable;
+an `@username` mapping binds identity to a handle a third party can
+acquire after a rename, so prefer ids here. A sender who is not mapped
+gets a configuration hint instead of a list.
 
 ## Local development
 

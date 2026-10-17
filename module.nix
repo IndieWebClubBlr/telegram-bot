@@ -123,8 +123,8 @@ in
       type = lib.types.attrsOf (lib.types.strMatching "(@[A-Za-z0-9_]+|[0-9]+)");
       default = { };
       example = {
-        "Abhinav Nair" = "@abnv";
-        "Priya Singh" = "123456789";
+        "Abhinav Nair" = "123456789";
+        "Priya Singh" = "@priya";
       };
       description = ''
         Mapping of Todoist collaborator names to Telegram mentions
@@ -135,9 +135,13 @@ in
         assignees are shown as plain text. Names and values must each
         be unique (compared case-insensitively) — a duplicate aborts
         startup with exit code 2. Keys must not contain ";" or "=".
-        Leave empty (the default) to show plain assignee names only.
-        Can also be set via the secrets environment file instead, in
-        which case leave this option empty.
+        Prefer numeric ids where the mapping is used for identity
+        (/mine): a @username can be renamed and re-acquired by
+        someone else. Leave empty (the default) to show plain
+        assignee names only. Can also be set via the secrets
+        environment file instead, in which case leave this option
+        empty — that also keeps names and handles out of the
+        world-readable Nix store.
       '';
     };
 

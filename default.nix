@@ -11,25 +11,24 @@ py.buildPythonApplication {
   version = "0.1.0";
   pyproject = true;
 
-  # Denylist: lib.cleanSource alone would copy .env (tokens) into the
-  # world-readable Nix store — it does not honor .gitignore.
+  # Allowlist: only ship what the build needs.  A filename denylist
+  # would copy any future secret file (.env.local, secrets.yaml, …)
+  # into the world-readable Nix store; lib.cleanSource alone does
+  # not honor .gitignore either.  The second layer drops bytecode
+  # that may sit inside src/.
   src = lib.cleanSourceWith {
-    src = ./.;
+    src = lib.sourceByRegex ./. [
+      "^src(/.*)?$"
+      "^pyproject\\.toml$"
+      "^README\\.md$"
+      "^LICENSE$"
+    ];
     filter =
       path: type:
       let
         base = baseNameOf path;
-        denied = builtins.elem base [
-          ".env"
-          ".direnv"
-          ".direnvrc"
-          ".envrc"
-          ".gitignore"
-          "__pycache__"
-          ".pytest_cache"
-        ];
       in
-      !denied && !(lib.hasSuffix ".pyc" base) && lib.cleanSourceFilter path type;
+      base != "__pycache__" && !(lib.hasSuffix ".pyc" base) && lib.cleanSourceFilter path type;
   };
 
   build-system = [ py.hatchling ];

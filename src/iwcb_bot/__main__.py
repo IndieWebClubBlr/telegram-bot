@@ -11,6 +11,14 @@ from .config import Config, ConfigError
 from .todoist_client import TodoistClient, TodoistError
 
 
+def _redact(message: str, secrets: tuple[str, ...]) -> str:
+    """Replace each configured secret in message with [redacted]."""
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    return message
+
+
 class _SecretRedactionFilter(logging.Filter):
     """Keep configured secrets out of every emitted log record.
 
@@ -31,9 +39,7 @@ class _SecretRedactionFilter(logging.Filter):
             message = record.getMessage()
         except Exception:  # noqa: BLE001 - never block logging
             return True
-        for secret in self._secrets:
-            message = message.replace(secret, "[redacted]")
-        record.msg = message
+        record.msg = _redact(message, self._secrets)
         record.args = ()
         if record.exc_info and not record.exc_text:
             try:
@@ -41,9 +47,7 @@ class _SecretRedactionFilter(logging.Filter):
             except Exception:  # noqa: BLE001 - never block logging
                 exc_text = None
             if exc_text:
-                for secret in self._secrets:
-                    exc_text = exc_text.replace(secret, "[redacted]")
-                record.exc_text = exc_text
+                record.exc_text = _redact(exc_text, self._secrets)
         return True
 
 
@@ -76,20 +80,25 @@ def main() -> None:
     # Handler filters run for records propagated from child loggers
     # (e.g. PTB's bootstrap networkloop, which logs the token on a
     # rejected login); a logger filter would miss those entirely.
-    secret_filter = _SecretRedactionFilter((cfg.telegram_token, cfg.todoist_token))
+    # The same secrets tuple also scrubs the post-config stderr
+    # prints below: PTB can embed raw response bodies — which a
+    # middlebox may fill with the bot-API URL, token included — in
+    # TelegramError messages, and print() bypasses logging handlers.
+    secrets = (cfg.telegram_token, cfg.todoist_token)
+    secret_filter = _SecretRedactionFilter(secrets)
     for handler in logging.getLogger().handlers:
         handler.addFilter(secret_filter)
 
-    todoist = TodoistClient(cfg.todoist_token, cfg.resolved_timezone)
+    todoist = TodoistClient(cfg.todoist_token, lambda: cfg.resolved_timezone)
     try:
         project = asyncio.run(todoist.resolve_project(cfg.project_id))
     except ConfigError as exc:
         asyncio.run(todoist.close())
-        print(f"Configuration error: {exc}", file=sys.stderr)
+        print(_redact(f"Configuration error: {exc}", secrets), file=sys.stderr)
         raise SystemExit(2) from exc
     except TodoistError as exc:
         asyncio.run(todoist.close())
-        print(f"Startup error: {exc}", file=sys.stderr)
+        print(_redact(f"Startup error: {exc}", secrets), file=sys.stderr)
         raise SystemExit(1) from exc
 
     application = build_application(cfg, project, todoist)
@@ -114,7 +123,7 @@ def main() -> None:
         )
         raise SystemExit(2) from None
     except TelegramError as exc:
-        print(f"Telegram error: {exc}", file=sys.stderr)
+        print(_redact(f"Telegram error: {exc}", secrets), file=sys.stderr)
         raise SystemExit(1) from exc
 
 

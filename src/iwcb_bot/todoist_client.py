@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, tzinfo
 from typing import TypeVar
@@ -74,8 +74,11 @@ def effective_day(
 
 
 class TodoistClient:
-    def __init__(self, token: str, timezone: tzinfo) -> None:
+    def __init__(self, token: str, timezone: Callable[[], tzinfo]) -> None:
         self._api = TodoistAPIAsync(token)
+        # A callable, not a frozen value: when TIMEZONE is unset the
+        # resolved zone is a fixed offset that goes stale across a DST
+        # transition — re-resolve it for every day-boundary computation.
         self._timezone = timezone
         # Project collaborator id → name, fetched once on first need and
         # cached.  _collaborator_misses remembers ids that were looked
@@ -230,9 +233,10 @@ class TodoistClient:
         tasks = await self._pages(
             "get_tasks", self._api.get_tasks(project_id=project_id, limit=200)
         )
+        tz = self._timezone()
         due_tasks: list[DueTask] = []
         for task in tasks:
-            day = effective_day(task.due, task.deadline, self._timezone)
+            day = effective_day(task.due, task.deadline, tz)
             if day is None or day > cutoff:
                 continue
             due_tasks.append(DueTask(task=task, due=day))
@@ -251,13 +255,14 @@ class TodoistClient:
         tasks = await self._pages(
             "get_tasks", self._api.get_tasks(project_id=project_id, limit=200)
         )
+        tz = self._timezone()
         due: list[DueTask] = []
         upcoming: list[DueTask] = []
         undated: list[DueTask] = []
         for task in tasks:
             if task.assignee_id != assignee_id:
                 continue
-            day = effective_day(task.due, task.deadline, self._timezone)
+            day = effective_day(task.due, task.deadline, tz)
             item = DueTask(task=task, due=day)
             if day is None:
                 undated.append(item)

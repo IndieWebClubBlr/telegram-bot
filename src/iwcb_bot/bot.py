@@ -150,8 +150,10 @@ async def _morning_loop(
     """Send the day's list to every allowed group chat at the configured time.
 
     Started by post_init only when morning_announce_time is set; the
-    task is cancelled by post_stop.  Each cycle sleeps until the next
-    wall-clock target (timestamp math — DST-correct) and then fires
+    task is cancelled by post_stop.  Each cycle re-derives the
+    timezone (so a DST shift cannot freeze a stale fixed offset when
+    TIMEZONE is unset) and sleeps until the next wall-clock target
+    (timestamp math — DST-correct) and then fires
     unconditionally: asyncio.sleep lands at or after the deadline, so
     re-deriving at wake would always roll to tomorrow and never send.
     The Todoist fetch is chat-independent and runs once per cycle,
@@ -165,11 +167,20 @@ async def _morning_loop(
     at = cfg.morning_announce_time
     if at is None:
         return
-    tz = cfg.resolved_timezone
     mentions = mentions_lookup(cfg)
     chat_types: dict[int, str] = {}
-    logger.info("morning list scheduled daily at %s (%s)", at.strftime("%H:%M"), tz)
+    logger.info(
+        "morning list scheduled daily at %s (%s)",
+        at.strftime("%H:%M"),
+        cfg.resolved_timezone,
+    )
     while True:
+        # Re-derive each cycle: when TIMEZONE is unset,
+        # resolved_timezone returns the server's *current* fixed
+        # offset — captured once, it would keep the old offset across
+        # a DST transition while cfg.today() moved on, drifting the
+        # announce time by an hour until restart.
+        tz = cfg.resolved_timezone
         target = next_announce(at, tz)
         await asyncio.sleep(max(0.0, target.timestamp() - datetime.now(tz).timestamp()))
         try:

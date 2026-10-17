@@ -651,6 +651,14 @@ class AssignCommand(_ListAction):
             "or /assign 5c Priya Singh"
         )
 
+    def validate(self, rest: str) -> str | None:
+        # Same cap as /due: without it the "not found" reply
+        # interpolates rest!r and can exceed Telegram's 4096-char
+        # message limit, surfacing a misleading send failure.
+        if len(rest) > 150:
+            return "Assignee too long — max 150 characters"
+        return None
+
     def begin_event(self, rest: str) -> Assign:
         # begin validates the event's type only; the Todoist-canonical
         # assignee name is resolved in perform and carried by commit.
