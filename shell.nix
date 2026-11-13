@@ -16,6 +16,7 @@ pkgs.mkShell {
     pythonEnv
     pkgs.black
     pkgs.basedpyright
+    pkgs.just
     pkgs.nixfmt
   ];
 

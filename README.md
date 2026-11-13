@@ -116,15 +116,24 @@ python -m iwcb_bot
 ```
 
 The shell provides Python with all dependencies on `PYTHONPATH`, plus the
-tooling:
+tooling. Common tasks are wrapped in the [`justfile`](./justfile):
 
 ```bash
-black src tests            # format Python
-basedpyright --pythonpath "$(command -v python)"   # type-check Python
-python -m pytest -q        # run the test suite
-nixfmt *.nix               # format Nix files
-nix-instantiate --eval --strict ./module-test.nix   # evaluate the NixOS module
+just                 # list recipes
+just run             # run the bot from src/ (needs the env vars above)
+just fmt             # format Python and Nix files
+just fmt-check       # check formatting without changing files
+just typecheck       # basedpyright
+just test            # pytest
+just lint            # ruff
+just module-test     # evaluate the NixOS module
+just build           # nix-build (runs pytest in the sandbox)
+just smoke           # built binary must exit 2 with no config
+just check           # all of the above
 ```
+
+`just lint` fetches `ruff` via `nix-shell -p ruff` because it is not part of
+the development shell.
 
 Tip: keep tokens out of shell history with an env file kept **outside the
 repo** (a `.env` inside the repo is excluded from the Nix build input — it
@@ -138,8 +147,9 @@ set -a; source ~/secrets/iwcb.env; set +a
 ## Building
 
 ```bash
-nix-build
+just build       # nix-build; runs pytest in the sandbox
 ./result/bin/iwcb-telegram-bot   # run the built package (needs env vars)
+just smoke       # assert the no-config exit code is 2
 ```
 
 ## Deploying on NixOS
