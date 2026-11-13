@@ -7,6 +7,8 @@ import pytest
 
 from iwcb_bot.config import Config, ConfigError
 
+from helpers import make_config as make_dataclass_config
+
 BASE_ENV = {
     "TELEGRAM_BOT_TOKEN": "123456:secret-tg-token",
     "TODOIST_API_TOKEN": "0123456789abcdef-secret-todoist",
@@ -276,3 +278,14 @@ class TestLogLevel:
     def test_invalid_rejected(self, raw: str) -> None:
         with pytest.raises(ConfigError, match="LOG_LEVEL"):
             make_config(LOG_LEVEL=raw)
+
+
+class TestResolvedTimezone:
+    def test_configured_timezone_preferred(self) -> None:
+        cfg = make_dataclass_config(timezone=ZoneInfo("Asia/Kolkata"))
+        assert cfg.resolved_timezone == ZoneInfo("Asia/Kolkata")
+
+    def test_unset_falls_back_to_server_local(self) -> None:
+        cfg = make_dataclass_config(timezone=None)
+        expected = datetime.now().astimezone().tzinfo
+        assert cfg.resolved_timezone == expected

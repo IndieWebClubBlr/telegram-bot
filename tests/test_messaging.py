@@ -1,0 +1,501 @@
+from __future__ import annotations
+
+from datetime import date
+
+import pytest
+from telegram.constants import ChatType, ReactionEmoji
+
+from iwcb_bot.messaging import (
+    BODY_LIMIT,
+    NBSP,
+    Status,
+    assignee_suffix,
+    chunk,
+    fmt_due,
+    is_group_chat_type,
+    md_html,
+    mentions_lookup,
+    one_line,
+    reaction_mode_applies,
+    render_list,
+    render_list_message,
+    render_text,
+    status_emoji,
+)
+from iwcb_bot.state import Task
+
+from helpers import make_config
+
+TODAY = date(2026, 10, 9)
+
+
+class TestOneLine:
+    def test_collapses_whitespace(self) -> None:
+        assert one_line("a\nb\t c") == "a b c"
+
+    def test_truncates_to_limit(self) -> None:
+        out = one_line("x" * 600)
+        assert len(out) == 500
+        assert out.endswith("…")
+
+    def test_short_text_untouched(self) -> None:
+        assert one_line("hello") == "hello"
+
+
+class TestChunk:
+    def test_short_text_single_chunk(self) -> None:
+        assert chunk("a\nb") == ["a\nb"]
+
+    def test_splits_on_line_boundaries(self) -> None:
+        text = "\n".join("line" + "x" * 100 for _ in range(50))
+        chunks = chunk(text)
+        assert len(chunks) > 1
+        assert all(len(c) <= 4000 for c in chunks)
+        # Chunks reassemble to the original (minus separator handling).
+        assert "\n".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+    def test_oversized_line_fails_loudly(self) -> None:
+        with pytest.raises(AssertionError):
+            chunk("H" * 5000)
+
+    def test_divider_glued_to_following_line(self) -> None:
+        # Fill a chunk right up to the limit with a divider as its last
+        # line; the divider must move down with the first task line.
+        filler = "y" * 3980
+        divider = "<b>📅 Due</b>"
+        task = "a task line"
+        chunks = chunk(f"{filler}\n{divider}\n{task}")
+        assert len(chunks) == 2
+        assert chunks[0] == filler
+        assert chunks[1] == f"{divider}\n{task}"
+
+    def test_divider_stays_when_glue_would_overflow(self) -> None:
+        # A near-limit task line cannot carry the divider down; the
+        # divider remains the last line (rare worst case, still valid).
+        divider = "<b>📅 Due</b>"
+        huge = "z" * 3995
+        chunks = chunk(f"{divider}\n{huge}")
+        assert chunks == [divider, huge]
+
+
+class TestMdHtml:
+    def test_link_renders(self) -> None:
+        out = md_html("on [events.indieweb.org](https://events.indieweb.org)")
+        assert out == (
+            'on <a href="https://events.indieweb.org">events.indieweb.org</a>'
+        )
+
+    def test_javascript_scheme_blocked(self) -> None:
+        out = md_html("[x](javascript:alert(1))")
+        assert "<a" not in out
+
+    def test_mailto_scheme_blocked(self) -> None:
+        out = md_html("[x](mailto:a@b.c)")
+        assert "<a" not in out
+
+    def test_relative_link_blocked(self) -> None:
+        out = md_html("[x](/rel/path)")
+        assert "<a" not in out
+
+    def test_data_image_blocked(self) -> None:
+        out = md_html("[x](data:image/png;base64,AAAA)")
+        assert "<a" not in out
+
+    def test_bare_url_linkified(self) -> None:
+        out = md_html("see https://example.com/x")
+        assert '<a href="https://example.com/x">' in out
+
+    def test_raw_html_escaped(self) -> None:
+        out = md_html("a <b>x</b> <script>y</script>")
+        assert "<b>" not in out and "<script>" not in out
+        assert "&lt;script&gt;" in out
+
+    def test_image_disabled(self) -> None:
+        out = md_html("![alt](https://x.y/z.png)")
+        assert "<img" not in out
+
+    def test_inline_formatting(self) -> None:
+        out = md_html("**b** *i* ~~s~~ `c`")
+        assert "<strong>b</strong>" in out
+        assert "<em>i</em>" in out
+        assert "<s>s</s>" in out
+        assert "<code>c</code>" in out
+
+    def test_unbalanced_brackets_left_alone(self) -> None:
+        assert md_html("Buy milk (2L) [unbalanced") == "Buy milk (2L) [unbalanced"
+
+
+class TestRenderText:
+    def test_plain_text_unchanged(self) -> None:
+        assert render_text("buy milk") == "buy milk"
+
+    def test_empty_and_whitespace_only(self) -> None:
+        assert render_text("") == ""
+        assert render_text(" \n\t ") == ""
+
+    def test_collapses_to_one_line(self) -> None:
+        out = render_text("line1\nline2  \tline3")
+        assert "\n" not in out
+        assert out == "line1 line2 line3"
+
+    def test_hard_break_does_not_become_br(self) -> None:
+        # Markdown hard break (two trailing spaces) must not emit <br>,
+        # which Telegram rejects.
+        out = render_text("line1  \nline2")
+        assert "<br" not in out
+        assert "line1 line2" in out
+
+    def test_markdown_link_renders(self) -> None:
+        out = render_text("[x](https://e.x)")
+        assert out == '<a href="https://e.x">x</a>'
+
+    def test_inline_formatting(self) -> None:
+        out = render_text("**b** *i* ~~s~~ `c`")
+        assert "<strong>b</strong>" in out
+        assert "<em>i</em>" in out
+        assert "<s>s</s>" in out
+        assert "<code>c</code>" in out
+
+    def test_javascript_scheme_blocked(self) -> None:
+        assert "<a" not in render_text("[x](javascript:alert(1))")
+
+    def test_raw_html_escaped(self) -> None:
+        out = render_text("<img src=x onerror=alert(1)>")
+        assert "<img" not in out
+        assert "&lt;img" in out
+
+    def test_long_text_truncated_to_limit(self) -> None:
+        out = render_text("x" * 600)
+        assert len(out) == 500
+        assert out.endswith("…")
+
+    def test_emoji_url_inflation_falls_back_to_plain(self) -> None:
+        # Percent-encoding of the emoji URL blows the HTML render past
+        # BODY_LIMIT; the fallback keeps the message sendable and the
+        # raw content readable (nothing here needs escaping).
+        raw = "[](https://e.com/" + "🎉" * 482 + ")"
+        assert len(md_html(raw)) > BODY_LIMIT
+        out = render_text(raw)
+        assert len(out) <= BODY_LIMIT
+        assert out == raw
+
+    def test_fallback_escapes_html(self) -> None:
+        raw = "<script>hi</script> [](https://e.com/" + "🎉" * 460 + ")"
+        assert len(md_html(raw)) > BODY_LIMIT
+        out = render_text(raw)
+        assert len(out) <= BODY_LIMIT
+        assert "<script>" not in out
+        assert "&lt;script&gt;" in out
+
+
+class TestRenderList:
+    def test_link_and_code_id(self) -> None:
+        items = [
+            Task(
+                task_id="6cabc",
+                text="Post on [events.indieweb.org](https://events.indieweb.org)",
+                due=TODAY,
+            )
+        ]
+        out = render_list(items, TODAY, show_dates=False)
+        assert '<a href="https://events.indieweb.org">' in out
+        assert out.startswith("<code>[")
+        assert out.endswith(
+            '</code>  Post on <a href="https://events.indieweb.org">events.indieweb.org</a>'
+        )
+
+    def test_multiline_text_stays_on_one_line(self) -> None:
+        items = [Task(task_id="aa", text="a\nb", due=TODAY)]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "\n" not in out
+        assert "a b" in out
+
+    def test_ids_bracketed_in_code_run(self) -> None:
+        items = [
+            Task(task_id="zab", text="one", due=TODAY),
+            Task(task_id="ab", text="two", due=TODAY),
+        ]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "<code>[zab]</code>" in out
+        # narrower id is padded so both code runs share one width
+        assert f"<code>[ab{NBSP}]</code>" in out
+
+    def test_long_text_truncated(self) -> None:
+        items = [Task(task_id="aa", text="x" * 600, due=TODAY)]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "…" in out
+        assert "x" * 501 not in out
+
+    def test_overdue_active_gets_marker_and_due_suffix(self) -> None:
+        items = [Task(task_id="aa", text="late", due=date(2026, 6, 9))]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "⚠ " in out
+        assert "— due Tue 9 Jun" in out
+
+    def test_overdue_done_has_no_due_suffix(self) -> None:
+        items = [Task(task_id="aa", text="late", due=date(2026, 6, 9), done=True)]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "<s>late</s>" in out
+        assert "— due" not in out
+
+    def test_today_item_has_no_due_suffix(self) -> None:
+        items = [Task(task_id="aa", text="task", due=TODAY)]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "— due" not in out
+
+    def test_done_item_wrapped_in_strike(self) -> None:
+        items = [Task(task_id="aa", text="task", due=TODAY, done=True)]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "<s>task</s>" in out
+
+    def test_show_dates_dated_all_lines(self) -> None:
+        items = [
+            Task(task_id="aa", text="today", due=TODAY),
+            Task(task_id="ab", text="later", due=date(2026, 10, 12)),
+            Task(task_id="ac", text="done", due=date(2026, 10, 11), done=True),
+        ]
+        out = render_list(items, TODAY, show_dates=True)
+        lines = out.splitlines()
+        assert "— due Fri 9 Oct" in lines[0]
+        assert "— due Mon 12 Oct" in lines[1]
+        assert "— due Sun 11 Oct" in lines[2]
+        assert "<s>done</s>" in lines[2]
+
+    def test_show_dates_overdue_keeps_marker(self) -> None:
+        items = [Task(task_id="aa", text="late", due=date(2026, 6, 9))]
+        out = render_list(items, TODAY, show_dates=True)
+        assert "⚠ " in out
+        assert "— due Tue 9 Jun" in out
+
+    def test_every_rendered_line_is_balanced_html(self) -> None:
+        items = [
+            Task(task_id="aa", text="line1\nline2 [x](https://e.x)", due=TODAY),
+            Task(task_id="ab", text="done", due=TODAY, done=True),
+        ]
+        out = render_list(items, TODAY, show_dates=False)
+        for line in out.splitlines():
+            assert line.count("<s>") == line.count("</s>")
+            assert line.count("<a ") == line.count("</a>")
+            assert line.count("<code>") == line.count("</code>")
+
+
+class TestFmtDue:
+    _REF = date(2026, 10, 9)
+
+    def test_same_year_omits_year(self) -> None:
+        assert fmt_due(date(2026, 6, 9), self._REF) == "Tue 9 Jun"
+
+    def test_same_day(self) -> None:
+        assert fmt_due(self._REF, self._REF) == "Fri 9 Oct"
+
+    def test_earlier_year_includes_year(self) -> None:
+        assert fmt_due(date(2025, 6, 9), self._REF) == "Mon 9 Jun 25"
+
+    def test_later_year_includes_year(self) -> None:
+        assert fmt_due(date(2027, 1, 2), self._REF) == "Sat 2 Jan 27"
+
+    def test_year_boundary_reference(self) -> None:
+        # /week on 30 Dec reaches into January of the next year.
+        assert fmt_due(date(2027, 1, 2), date(2026, 12, 30)) == "Sat 2 Jan 27"
+        assert fmt_due(date(2026, 12, 31), date(2026, 12, 30)) == "Thu 31 Dec"
+
+
+class TestRenderListDividers:
+    def test_headers_print_before_their_items(self) -> None:
+        items = [
+            Task(task_id="aa", text="due task", due=TODAY),
+            Task(task_id="ab", text="future", due=date(2026, 10, 12)),
+            Task(task_id="ac", text="someday", due=None),
+        ]
+        rendered = render_list(
+            items,
+            TODAY,
+            show_dates=True,
+            dividers={0: "📅 Due", 1: "📆 Upcoming", 2: "🗓 No date"},
+        )
+        lines = rendered.split("\n")
+        assert lines[0] == "<b>📅 Due</b>"
+        assert lines[2] == "<b>📆 Upcoming</b>"
+        assert lines[4] == "<b>🗓 No date</b>"
+
+    def test_undated_line_has_no_date_suffix(self) -> None:
+        items = [Task(task_id="aa", text="someday", due=None)]
+        rendered = render_list(items, TODAY, show_dates=True)
+        assert rendered == "<code>[aa]</code>  someday"
+
+    def test_undated_line_never_overdue(self) -> None:
+        items = [Task(task_id="aa", text="someday", due=None, done=False)]
+        rendered = render_list(items, TODAY, show_dates=False)
+        assert "⚠" not in rendered
+
+
+class TestMentionsLookup:
+    def test_casefolds_names(self) -> None:
+        cfg = make_config(assignee_mentions={"Abhinav Nair": "@abnv"})
+        assert mentions_lookup(cfg) == {"abhinav nair": "@abnv"}
+
+    def test_empty_by_default(self) -> None:
+        assert mentions_lookup(make_config(assignee_mentions={})) == {}
+
+
+class TestAssigneeSuffix:
+    _MENTIONS = {"abhinav nair": "@abnv", "priya singh": "123456789"}
+
+    def test_unassigned_renders_nothing(self) -> None:
+        assert assignee_suffix(None, self._MENTIONS) == ""
+
+    def test_mapped_handle_renders_handle(self) -> None:
+        assert assignee_suffix("Abhinav Nair", self._MENTIONS) == " — @abnv"
+
+    def test_mapped_id_renders_tg_mention(self) -> None:
+        assert (
+            assignee_suffix("Priya Singh", self._MENTIONS)
+            == ' — <a href="tg://user?id=123456789">Priya Singh</a>'
+        )
+
+    def test_unmapped_name_renders_escaped_text(self) -> None:
+        assert assignee_suffix("A&B C", self._MENTIONS) == " — A&amp;B C"
+
+    def test_lookup_is_case_insensitive(self) -> None:
+        assert assignee_suffix("ABHINAV NAIR", self._MENTIONS) == " — @abnv"
+
+    def test_name_html_escaped_in_tg_mention(self) -> None:
+        mentions = {"a&b": "1"}
+        assert (
+            assignee_suffix("A&B", mentions)
+            == ' — <a href="tg://user?id=1">A&amp;B</a>'
+        )
+
+
+class TestRenderListAssignee:
+    _ITEM = Task(
+        task_id="62ab",
+        text="buy milk",
+        due=date(2026, 10, 9),
+        assignee="Abhinav Nair",
+    )
+
+    def test_assignee_between_text_and_due(self) -> None:
+        rendered = render_list(
+            [self._ITEM],
+            date(2026, 10, 9),
+            show_dates=True,
+            mentions={"abhinav nair": "@abnv"},
+        )
+        assert rendered == "<code>[ab]</code>  buy milk — @abnv — due Fri 9 Oct"
+
+    def test_no_mentions_map_shows_plain_name(self) -> None:
+        rendered = render_list([self._ITEM], date(2026, 10, 9), show_dates=False)
+        assert "buy milk — Abhinav Nair" in rendered
+
+    def test_unassigned_has_no_suffix(self) -> None:
+        item = Task(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
+        rendered = render_list(
+            [item], date(2026, 10, 9), show_dates=False, mentions={"x": "@y"}
+        )
+        assert rendered == "<code>[ab]</code>  buy milk"
+
+
+class TestIsGroupChatType:
+    def test_group_true(self) -> None:
+        assert is_group_chat_type("group") is True
+
+    def test_supergroup_true(self) -> None:
+        assert is_group_chat_type("supergroup") is True
+
+    def test_private_false(self) -> None:
+        assert is_group_chat_type("private") is False
+
+    def test_channel_false(self) -> None:
+        assert is_group_chat_type("channel") is False
+
+    def test_unknown_false(self) -> None:
+        assert is_group_chat_type("") is False
+
+
+class TestReactionModeApplies:
+    @pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+    def test_flag_on_in_group_reacts(self, chat_type: str) -> None:
+        assert reaction_mode_applies(True, chat_type) is True
+
+    @pytest.mark.parametrize("chat_type", ["private", "channel", ""])
+    def test_flag_on_outside_group_texts(self, chat_type: str) -> None:
+        assert reaction_mode_applies(True, chat_type) is False
+
+    def test_unresolvable_chat_type_texts(self) -> None:
+        assert reaction_mode_applies(True, None) is False
+
+    @pytest.mark.parametrize("chat_type", ["group", "supergroup", "private", None])
+    def test_flag_off_never_reacts(self, chat_type: str | None) -> None:
+        assert reaction_mode_applies(False, chat_type) is False
+
+    def test_accepts_chat_type_str_enum(self) -> None:
+        # Chat.type arrives as ChatType (a str-enum), not a bare str —
+        # no .value unwrapping at the call site.
+        assert reaction_mode_applies(True, ChatType.GROUP) is True
+        assert reaction_mode_applies(True, ChatType.PRIVATE) is False
+
+
+class TestRenderListMessage:
+    ITEM = Task(task_id="62ab", text="buy milk", due=date(2026, 10, 9))
+    TASKS = {ITEM.task_id: ITEM}
+
+    def test_empty_returns_no_chunks(self) -> None:
+        chunks = render_list_message([], {}, TODAY, mentions={}, show_dates=False)
+        assert chunks == []
+
+    def test_headline_prefixes_single_chunk(self) -> None:
+        chunks = render_list_message(
+            [self.ITEM.task_id],
+            self.TASKS,
+            TODAY,
+            mentions={},
+            show_dates=False,
+            headline="Daily Task Reminder",
+        )
+        assert len(chunks) == 1
+        assert chunks[0].startswith("Daily Task Reminder\n\n")
+        assert "<code>[ab]</code>" in chunks[0]
+
+    def test_cutoff_header_between_headline_and_body(self) -> None:
+        chunks = render_list_message(
+            [self.ITEM.task_id],
+            self.TASKS,
+            TODAY,
+            mentions={},
+            show_dates=True,
+            cutoff=date(2026, 10, 11),
+            headline="Daily Task Reminder",
+        )
+        assert len(chunks) == 1
+        body = chunks[0]
+        assert body.startswith("Daily Task Reminder\n\n<b>Due by Sun 11 Oct:</b>")
+        assert "buy milk — due Fri 9 Oct" in body
+
+    def test_body_only_without_headline_or_cutoff(self) -> None:
+        chunks = render_list_message(
+            [self.ITEM.task_id], self.TASKS, TODAY, mentions={}, show_dates=False
+        )
+        assert chunks == ["<code>[ab]</code>  buy milk"]
+
+    def test_missing_entity_for_id_raises(self) -> None:
+        # Storage invariant: every stored list id has a map entity, so
+        # a miss is a bug — never a silently skipped line.
+        with pytest.raises(AssertionError, match="no entity in the map"):
+            render_list_message(["zz"], {}, TODAY, mentions={}, show_dates=False)
+
+
+class TestStatusEmoji:
+    @pytest.mark.parametrize(
+        ("status", "emoji"),
+        [("ok", "👍"), ("soft", "🤨"), ("hard", "👎")],
+    )
+    def test_status_maps_to_emoji(self, status: Status, emoji: str) -> None:
+        assert status_emoji(status) == emoji
+
+    def test_all_statuses_are_valid_reaction_emoji(self) -> None:
+        # Telegram's reaction API rejects emoji outside its fixed set —
+        # a typo'd mapping would silently drop every status line.
+        valid = {entry.value for entry in ReactionEmoji}
+        mapped = {status_emoji("ok"), status_emoji("soft"), status_emoji("hard")}
+        assert mapped <= valid
