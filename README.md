@@ -5,6 +5,8 @@ configured project. Vanilla Nix packaging plus a NixOS module (no flakes) —
 the module is imported by your machine's NixOS configuration, which is also
 where secrets live (e.g. via sops-nix).
 
+See [DESIGN.md](./DESIGN.md) for the architecture and the reasoning behind it.
+
 ## Commands
 
 All commands operate on the configured project only.
@@ -20,7 +22,7 @@ All commands operate on the configured project only.
 | `/done <id>` | Complete the task whose ID ends with `<id>` from the last shown list (`/today`, `/tomorrow` or `/week`) or your `/mine` list (matching is case-insensitive; the same task in both lists is one match). Strikes the line in place (lists that fit a single message) in every list that shows it — including other users' `/mine` lists — and confirms; for a recurring task the struck line shows the rolled next-occurrence date and the confirmation includes it too. A task already struck in the list is refused (completing it again would close the next occurrence of a recurring task). Stale data (task changed elsewhere) gives a safe error |
 | `/undo <id>` | Reopen a task completed with `/done` from the last shown list or your `/mine` list, un-striking it in every list that shows it. Refuses recurring tasks — completing one rolls it to its next occurrence |
 | `/edit <id> <new text>` | Edit the task whose ID ends with `<id>` from the last shown list or your `/mine` list; the new text appears in every list that shows the task. Already-completed tasks are refused. The text is stored verbatim — quick-add parsing (dates, `p1`, `@labels`) happens only on creation (`/add`), so those tokens become part of the task name. Recurring: the new name applies to all occurrences. Max 500 characters |
-| `/assign <id> <assignee>` | Assign the task whose ID ends with `<id>` to a project collaborator. The assignee is a Telegram `@handle` (resolved through `ASSIGNEE_MENTIONS`, with or without the `@`), a numeric Telegram id from the same mapping, or a Todoist collaborator name (`Priya Singh` — multi-word names work). The new assignee appears in every list that shows the task, and mapped names render as clickable mentions. Already-completed tasks are refused; a handle shared by several collaborators is ambiguous — use the full Todoist name. Clearing an assignee is not supported (Todoist UI only) |
+| `/assign <id> <assignee>` | Assign the task whose ID ends with `<id>` to a project collaborator. The assignee is a Telegram `@handle` (resolved through `ASSIGNEE_MENTIONS`, with or without the `@`), a numeric Telegram id from the same mapping, or a Todoist collaborator name (`Priya Singh` — multi-word names work). The new assignee appears in every list that shows the task, and mapped names render as clickable mentions. Already-completed tasks are refused; an unmatched name gets a lookup error pointing at `ASSIGNEE_MENTIONS`. Clearing an assignee is not supported (Todoist UI only) |
 | `/due <id> <when>` | Change when the task whose ID ends with `<id>` is due. `<when>` is any Todoist natural-language date — `tomorrow`, `next monday 5pm`, `every friday`, or `no date` to clear — parsed by Todoist's own server-side parser (the same one quick-add uses); the reply echoes what was understood (`📅 buy milk → Fri 17 Oct`). Works on recurring tasks (updates the pattern). Already-completed tasks are refused. Max 150 characters |
 | `/project` | Link to the configured project in Todoist |
 
@@ -33,7 +35,7 @@ commands addressed to other bots (`/cmd@OtherBot`) are ignored.
 
 Task text is markdown (that's how Todoist stores it): links, **bold**,
 *italic*, ~~strike~~, `code` and bare URLs are rendered in list lines and
-in `/add`, `/done`, `/undo`, `/edit` and `/assign` replies.
+in `/add`, `/done`, `/undo`, `/edit`, `/assign` and `/due` replies.
 
 The bot keeps all state in memory: a restart loses the saved lists, so `/done`,
 `/undo` and `/edit` need a fresh `/today`, `/tomorrow`, `/week` or `/mine`
@@ -41,8 +43,9 @@ first. Each list command (and each `/add` list-refresh) replaces the chat-level
 saved list, which closes the `/undo` window for tasks completed before it; a
 `/mine` replaces only your own per-user list. Lists from a previous day are
 discarded — the bot asks for a fresh one instead of acting on stale IDs.
-`/done`, `/undo` and `/edit` resolve IDs against your `/mine` list and the
-chat-level list together, and apply the change everywhere the task appears.
+`/done`, `/undo`, `/edit`, `/assign` and `/due` resolve IDs against your
+`/mine` list and the chat-level list together, and apply the change everywhere
+the task appears.
 
 Recurring tasks: completing one never leaves Todoist's completed state — the
 same task stays active, just rolled to its next date. `/undo` therefore
@@ -57,8 +60,8 @@ While a command is talking to Todoist (`/add`, `/today`, `/tomorrow`, `/week`,
 Unless disabled with `MORNING_ANNOUNCE_TIME=off`, the bot proactively sends
 the day's task list — titled **Daily Task Reminder**, otherwise same rendering
 as `/today` — to every allowed **group** chat (private chats are skipped) at
-the configured wall-clock time
-(default 09:00) in the `TIMEZONE` zone. The sent list becomes that chat's last
+the configured wall-clock time (default 09:00) in `TIMEZONE` (or the server's
+local zone when `TIMEZONE` is unset). The sent list becomes that chat's last
 shown list — `/done`, `/undo` and `/edit` work on it immediately, no fresh
 `/today` needed, and the title stays visible as lines are struck. In forum
 groups the message lands in the General topic (commands still answer in their
@@ -81,7 +84,7 @@ errors) — plus a few optional ones:
 | `TODOIST_API_TOKEN` | Todoist → Settings → Integrations → API token. An invalid or expired token is a startup error (exit code 1) — the unit retries every 5 s and gives up after 5 failures in 5 minutes |
 | `TODOIST_PROJECT_ID` | Project ID: the part after the last dash of the project URL, `https://app.todoist.com/app/project/<name-slug>-<id>` (e.g. `6X4Vw2Hfmg73Q2XR`). Loaded once at startup; a bad ID aborts startup with exit code 2 |
 | `ALLOWED_CHAT_IDS` | Comma-separated Telegram chat IDs allowed to use the bot. Group IDs are negative (e.g. `-1001234567890`) — learn one by forwarding a group message to an ID-reporting bot such as [@getidsbot](https://t.me/getidsbot) |
-| `TIMEZONE` | Optional IANA time zone for the bot's "today" calculations (e.g. `Asia/Kolkata`). The server and the bot's users are often in different time zones, so set this explicitly; an invalid value aborts startup with exit code 2. Falls back to the server's local time zone — but only its offset at startup, so on a DST-observing server the morning reminder drifts by an hour after a transition until restart; set `TIMEZONE` to avoid this. Naive due datetimes (the normal Todoist shape) are taken as wall-clock times in this zone; timezone-aware dues are converted into it before the calendar day is taken |
+| `TIMEZONE` | Optional IANA time zone for the bot's "today" calculations (e.g. `Asia/Kolkata`). The server and the bot's users are often in different time zones, so set this explicitly; an invalid value aborts startup with exit code 2. Falls back to the server's local offset; that fallback does not follow DST, so it can misplace the announcement time and timezone-aware due dates around a transition — set `TIMEZONE` to avoid this. Naive due datetimes (the normal Todoist shape) are taken as wall-clock times in this zone; timezone-aware dues are converted into it before the calendar day is taken |
 | `MORNING_ANNOUNCE_TIME` | Optional wall-clock time (24h `HH:MM`, in the `TIMEZONE` zone) at which the bot proactively sends the day's task list to every allowed group chat (private chats are skipped). Defaults to `09:00`; set to `off` to disable. An invalid value aborts startup with exit code 2 |
 | `MORNING_ANNOUNCE_WHEN_EMPTY` | `true` (default) or `false` — whether the daily list is sent when nothing is due. `true` posts the title over "Nothing due today 🎉"; `false` stays silent and clears the chat's stored list so the previous day's message stops updating. Case-insensitive; an invalid value aborts startup with exit code 2 |
 | `REACTION_REPLIES` | `false` (default) or `true` — in group chats, action-command feedback (`/add`, `/done`, `/undo`, `/edit`, `/assign`, `/due`, unknown-command hints and `/mine`'s configuration hints) becomes a reaction on the command message instead of a text reply: 👍 success, 🤨 soft refusal (usage error, no match, already completed), 👎 failure (Todoist/API errors). One reaction per command, so an `/add` whose list refresh fails still gets only 👍 — the stale-list note has no channel in this mode. List messages (`/today`, `/tomorrow`, `/week`, `/mine`, `/help`, `/project`) are always sent as text, private chats always keep text replies, and a rejected reaction logs at `DEBUG` and stays silent — no text fallback. Case-insensitive; an invalid value aborts startup with exit code 2 |
@@ -239,20 +242,19 @@ services.todoist-telegram-bot.instances = {
 };
 ```
 
-Each environment file must contain only that instance's two tokens. If it
-also sets `TODOIST_PROJECT_ID`, `ALLOWED_CHAT_IDS` or `TIMEZONE`, the module
-options still win: the module writes them to a second, per-instance
+Each environment file needs only that instance's two tokens. If it also sets
+`TODOIST_PROJECT_ID`, `ALLOWED_CHAT_IDS` or `TIMEZONE`, the module options
+still win: the module writes them to a second, per-instance
 environment file that systemd reads *after* this one (later
 `EnvironmentFile=` entries override earlier ones, and all of them override
 `Environment=`).
 
 ### systemd hardening
 
-The unit runs as a dynamic user with no writable filesystem, no capabilities,
-no device/node access, an allowlist-only syscall filter
-(`@system-service ~@privileged`), restricted address families and a read-only
-view of the system. If a future systemd/NixOS version rejects one of the
-options, trim it from `module.nix`.
+The unit runs as a dynamic user with a read-only system view (plus a private
+`/tmp`), no capabilities, a minimal `/dev`, an allowlist-only syscall filter
+(`@system-service ~@privileged`) and restricted address families. If a future
+systemd/NixOS version rejects one of the options, trim it from `module.nix`.
 
 ## License
 
