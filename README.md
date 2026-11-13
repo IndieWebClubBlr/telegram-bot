@@ -256,6 +256,15 @@ The unit runs as a dynamic user with a read-only system view (plus a private
 (`@system-service ~@privileged`) and restricted address families. If a future
 systemd/NixOS version rejects one of the options, trim it from `module.nix`.
 
+## AI-assisted development
+
+This project was developed with an AI coding agent. The agent wrote and
+refactored the Python code, tests, Nix packaging, NixOS module and
+documentation under human direction; the human made the design decisions,
+reviewed every change, ran the verification battery and made the commits. The
+agent had no live Telegram or Todoist credentials, so behaviour was verified
+through the offline fakes and test suite rather than live API calls.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
