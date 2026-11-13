@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, time, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
-from iwcb_bot.bot import next_announce
+from iwcb_bot.bot import _send_morning_list, next_announce
+from iwcb_bot.state import get_chat_list, put_tasks
+
+from helpers import (
+    PROJECT,
+    FakeTelegram,
+    FakeTodoist,
+    due_task,
+    make_config,
+    make_state_task,
+    seed_chat_list,
+)
 
 _KOLKATA = ZoneInfo("Asia/Kolkata")  # UTC+5:30
 
@@ -56,3 +70,111 @@ class TestNextAnnounce:
         assert target == datetime(2026, 3, 8, 9, 0, tzinfo=new_york)
         assert target.utcoffset() == timedelta(hours=-4)
         assert target.timestamp() - now.timestamp() == 12 * 3600.0
+
+
+class TestSendMorningList:
+    """The morning announcement body (_send_morning_list).
+
+    Called directly with a fake Application; the loop/scheduling is not
+    exercised here — next_announce covers the date math.
+    """
+
+    CHAT_ID = 1
+
+    def _application(self, chat_data: dict[str, Any]) -> Any:
+        return cast(
+            Any,
+            SimpleNamespace(
+                chat_data={self.CHAT_ID: chat_data},
+                bot=FakeTelegram(),
+            ),
+        )
+
+    def _send(
+        self,
+        application: Any,
+        todoist: FakeTodoist,
+        tasks: list[Any],
+        *,
+        send_when_empty: bool,
+    ) -> None:
+        cfg = make_config()
+        today = cfg.today()
+        asyncio.run(
+            _send_morning_list(
+                application,
+                self.CHAT_ID,
+                tasks,
+                today,
+                today,
+                {},
+                todoist,
+                PROJECT.id,
+                send_when_empty=send_when_empty,
+            )
+        )
+
+    def test_sends_titled_list_and_stores_it(self) -> None:
+        cfg = make_config()
+        today = cfg.today()
+        todoist = FakeTodoist()
+        chat_data: dict[str, Any] = {}
+        application = self._application(chat_data)
+        self._send(
+            application,
+            todoist,
+            [due_task("t1", "buy milk", due_date=today)],
+            send_when_empty=True,
+        )
+        # the announcement goes out under the reminder title
+        texts = application.bot.sent_texts()
+        assert len(texts) == 1
+        assert "Daily Task Reminder" in texts[0]
+        assert "buy milk" in texts[0]
+        # and becomes the chat's last shown list for /done, /undo, /edit
+        stored = get_chat_list(chat_data)
+        assert stored is not None
+        assert stored.headline == "<b>Daily Task Reminder</b>"
+        assert stored.task_ids == ["t1"]
+        assert stored.day == today
+
+    def test_empty_day_sends_congratulations_when_enabled(self) -> None:
+        chat_data: dict[str, Any] = {}
+        application = self._application(chat_data)
+        self._send(application, FakeTodoist(), [], send_when_empty=True)
+        texts = application.bot.sent_texts()
+        assert len(texts) == 1
+        assert "Daily Task Reminder" in texts[0]
+        assert "Nothing due today 🎉" in texts[0]
+
+    def test_empty_day_is_silent_and_clears_stale_list(self) -> None:
+        cfg = make_config()
+        today = cfg.today()
+        chat_data: dict[str, Any] = {}
+        # yesterday's list is still stored; an empty quiet morning must
+        # retire it so the old message stops updating.
+        seed_chat_list(
+            chat_data,
+            {"5c": make_state_task("5c", "buy milk")},
+            day=today - timedelta(days=1),
+        )
+        application = self._application(chat_data)
+        self._send(application, FakeTodoist(), [], send_when_empty=False)
+        assert application.bot.calls == []
+        assert get_chat_list(chat_data) is None
+
+    def test_locally_done_task_is_not_reannounced(self) -> None:
+        cfg = make_config()
+        today = cfg.today()
+        chat_data: dict[str, Any] = {}
+        # a /done landed since the fetch: the record is done locally
+        put_tasks(chat_data, [make_state_task("t1", "buy milk", done=True)])
+        application = self._application(chat_data)
+        self._send(
+            application,
+            FakeTodoist(),
+            [due_task("t1", "buy milk", due_date=today)],
+            send_when_empty=False,
+        )
+        assert application.bot.calls == []
+        assert get_chat_list(chat_data) is None
