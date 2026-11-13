@@ -9,6 +9,7 @@ from iwcb_bot.messaging import (
     BODY_LIMIT,
     NBSP,
     Status,
+    _MESSAGE_LIMIT,
     assignee_suffix,
     chunk,
     fmt_due,
@@ -27,6 +28,21 @@ from iwcb_bot.state import Task
 from helpers import make_config
 
 TODAY = date(2026, 10, 9)
+
+
+def _inflated_raw(prefix: str) -> str:
+    """A markdown-URL string whose HTML render exceeds BODY_LIMIT.
+
+    The emoji count is derived from the current limit/encoding rather
+    than pinned, so a limit or escaping change cannot silently make the
+    precondition false.
+    """
+    count = 0
+    while True:
+        raw = f"{prefix}{'🎉' * count})"
+        if len(md_html(raw)) > BODY_LIMIT:
+            return raw
+        count += 1
 
 
 class TestOneLine:
@@ -50,30 +66,32 @@ class TestChunk:
         text = "\n".join("line" + "x" * 100 for _ in range(50))
         chunks = chunk(text)
         assert len(chunks) > 1
-        assert all(len(c) <= 4000 for c in chunks)
+        assert all(len(c) <= _MESSAGE_LIMIT for c in chunks)
         # Chunks reassemble to the original (minus separator handling).
         assert "\n".join(chunks).replace("\n", "") == text.replace("\n", "")
 
     def test_oversized_line_fails_loudly(self) -> None:
         with pytest.raises(AssertionError):
-            chunk("H" * 5000)
+            chunk("H" * (_MESSAGE_LIMIT + 1))
 
     def test_divider_glued_to_following_line(self) -> None:
         # Fill a chunk right up to the limit with a divider as its last
         # line; the divider must move down with the first task line.
-        filler = "y" * 3980
         divider = "<b>📅 Due</b>"
         task = "a task line"
+        # Exactly fills the limit with divider as the last line; the
+        # task line then cannot fit and must take the divider with it.
+        filler = "y" * (_MESSAGE_LIMIT - len(divider) - 1)
         chunks = chunk(f"{filler}\n{divider}\n{task}")
         assert len(chunks) == 2
         assert chunks[0] == filler
         assert chunks[1] == f"{divider}\n{task}"
 
     def test_divider_stays_when_glue_would_overflow(self) -> None:
-        # A near-limit task line cannot carry the divider down; the
-        # divider remains the last line (rare worst case, still valid).
+        # A full-limit line cannot carry the divider down; the divider
+        # remains the last line (rare worst case, still valid).
         divider = "<b>📅 Due</b>"
-        huge = "z" * 3995
+        huge = "z" * _MESSAGE_LIMIT
         chunks = chunk(f"{divider}\n{huge}")
         assert chunks == [divider, huge]
 
@@ -173,14 +191,14 @@ class TestRenderText:
         # Percent-encoding of the emoji URL blows the HTML render past
         # BODY_LIMIT; the fallback keeps the message sendable and the
         # raw content readable (nothing here needs escaping).
-        raw = "[](https://e.com/" + "🎉" * 482 + ")"
+        raw = _inflated_raw("[](https://e.com/")
         assert len(md_html(raw)) > BODY_LIMIT
         out = render_text(raw)
         assert len(out) <= BODY_LIMIT
         assert out == raw
 
     def test_fallback_escapes_html(self) -> None:
-        raw = "<script>hi</script> [](https://e.com/" + "🎉" * 460 + ")"
+        raw = _inflated_raw("<script>hi</script> [](https://e.com/")
         assert len(md_html(raw)) > BODY_LIMIT
         out = render_text(raw)
         assert len(out) <= BODY_LIMIT

@@ -74,9 +74,13 @@ class TestTimezone:
         assert make_config().timezone is None
 
     def test_today_returns_today_in_configured_zone(self) -> None:
+        tz = ZoneInfo("Asia/Kolkata")
         cfg = make_config(TIMEZONE="Asia/Kolkata")
-        expected = datetime.now(tz=ZoneInfo("Asia/Kolkata")).date()
-        assert cfg.today() == expected
+        # Bracket the call so a run spanning midnight cannot flake.
+        before = datetime.now(tz=tz).date()
+        today = cfg.today()
+        after = datetime.now(tz=tz).date()
+        assert today in {before, after}
 
 
 class TestAssigneeMentions:
@@ -287,5 +291,9 @@ class TestResolvedTimezone:
 
     def test_unset_falls_back_to_server_local(self) -> None:
         cfg = make_dataclass_config(timezone=None)
-        expected = datetime.now().astimezone().tzinfo
-        assert cfg.resolved_timezone == expected
+        # Bracket the call: the server-local tzinfo can change on a DST
+        # transition mid-run.
+        before = datetime.now().astimezone().tzinfo
+        resolved = cfg.resolved_timezone
+        after = datetime.now().astimezone().tzinfo
+        assert resolved in {before, after}

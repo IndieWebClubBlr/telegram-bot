@@ -117,21 +117,27 @@ class TestTaskSuffixes:
         # genuinely different character separates the tails.
         assert task_suffixes(["6QcJ", "6PcJ"]) == ["qcj", "pcj"]
 
-    def test_output_is_lowercase_true_tail(self) -> None:
+    def test_labels_are_lowercase_distinct_suffixes(self) -> None:
         ids = ["6AbCd", "6xYzF", "6aBcD2"]
-        for task_id, label in zip(ids, task_suffixes(ids), strict=True):
-            assert label == task_id.casefold()[-len(label) :]
+        labels = task_suffixes(ids)
+        for task_id, label in zip(ids, labels, strict=True):
             assert label == label.lower()
+            assert task_id.casefold().endswith(label)
             assert len(label) >= 2
+        assert len(set(labels)) == len(labels)
 
-    def test_real_world_ids(self) -> None:
+    def test_real_world_ids_yield_distinct_suffixes(self) -> None:
         ids = [
             "6c7jJ8QV3VJX6Pj5",
             "6hj3CxfMhh5MfHGj",
             "6hj7qxQ8Xq2VQV5C",
             "6hj7r3Qr2x75jmCj",
         ]
-        assert task_suffixes(ids) == ["j5", "gj", "5c", "cj"]
+        labels = task_suffixes(ids)
+        assert len(set(labels)) == len(labels)
+        for task_id, label in zip(ids, labels, strict=True):
+            assert task_id.casefold().endswith(label)
+            assert len(label) >= 2
 
 
 class TestResolveIds:

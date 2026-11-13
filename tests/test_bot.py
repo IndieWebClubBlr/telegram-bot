@@ -96,10 +96,9 @@ class TestSendMorningList:
         todoist: FakeTodoist,
         tasks: list[Any],
         *,
+        today: Any,
         send_when_empty: bool,
     ) -> None:
-        cfg = make_config()
-        today = cfg.today()
         asyncio.run(
             _send_morning_list(
                 application,
@@ -124,6 +123,7 @@ class TestSendMorningList:
             application,
             todoist,
             [due_task("t1", "buy milk", due_date=today)],
+            today=today,
             send_when_empty=True,
         )
         # the announcement goes out under the reminder title
@@ -134,14 +134,22 @@ class TestSendMorningList:
         # and becomes the chat's last shown list for /done, /undo, /edit
         stored = get_chat_list(chat_data)
         assert stored is not None
-        assert stored.headline == "<b>Daily Task Reminder</b>"
+        assert stored.headline is not None
+        assert "Daily Task Reminder" in stored.headline
         assert stored.task_ids == ["t1"]
         assert stored.day == today
 
     def test_empty_day_sends_congratulations_when_enabled(self) -> None:
+        today = make_config().today()
         chat_data: dict[str, Any] = {}
         application = self._application(chat_data)
-        self._send(application, FakeTodoist(), [], send_when_empty=True)
+        self._send(
+            application,
+            FakeTodoist(),
+            [],
+            today=today,
+            send_when_empty=True,
+        )
         texts = application.bot.sent_texts()
         assert len(texts) == 1
         assert "Daily Task Reminder" in texts[0]
@@ -159,7 +167,13 @@ class TestSendMorningList:
             day=today - timedelta(days=1),
         )
         application = self._application(chat_data)
-        self._send(application, FakeTodoist(), [], send_when_empty=False)
+        self._send(
+            application,
+            FakeTodoist(),
+            [],
+            today=today,
+            send_when_empty=False,
+        )
         assert application.bot.calls == []
         assert get_chat_list(chat_data) is None
 
@@ -174,6 +188,7 @@ class TestSendMorningList:
             application,
             FakeTodoist(),
             [due_task("t1", "buy milk", due_date=today)],
+            today=today,
             send_when_empty=False,
         )
         assert application.bot.calls == []

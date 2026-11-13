@@ -9,9 +9,12 @@ any accidental real HTTP call raises.
 
 from __future__ import annotations
 
+import asyncio
+import re
 from datetime import timedelta
 from typing import Any
 
+import pytest
 from telegram.error import TelegramError
 
 from iwcb_bot.bot import build_application
@@ -211,12 +214,13 @@ class TestList:
         # tasks are in the chat map for suffix resolution
         assert get_tasks(chat_data)
 
-    def test_week_uses_six_day_cutoff(self):
+    def test_week_cutoff_uses_days_argument(self):
         todoist = make_todoist()
         todoist.due_by_result = []
         cfg = make_config()
         fakes = build_fakes()
-        # /week is registered with days=6 (today + next 6 days)
+        # Unit scope: ListCommand derives cutoff from its days arg.
+        # Registration wiring is covered by TestRegistration.
         run(ListCommand(cfg, todoist, PROJECT, 6, "cmd_week"), fakes)
         cutoff = cfg.today() + timedelta(days=6)
         assert todoist.method_calls("tasks_due_by") == [
@@ -273,8 +277,10 @@ class TestDone:
         seed_chat_list(chat_data, {"5c": make_state_task("5c", "buy milk")}, day=today)
         fakes = build_fakes(args=["5c"], chat_data=chat_data)
         run(DoneCommand(make_config(), todoist, PROJECT), fakes)
-        # the stored list message is re-edited with the task struck through
-        assert any("<s>" in t for t in fakes.bot.edits())
+        # the stored list message is re-edited with the task struck
+        # through (any of Telegram's valid strike tags)
+        strike = re.compile(r"<(?:s|del|strike)>")
+        assert any(strike.search(t) for t in fakes.bot.edits())
 
     def test_ambiguous_id_is_soft_reply(self):
         todoist = make_todoist()
@@ -486,16 +492,18 @@ class TestAssign:
 
     def test_exactly_150_chars_is_accepted(self):
         todoist = make_todoist()
-        todoist.collab_ids = {"Priya Singh": "99"}
-        todoist.collab_names = {"99": "Priya Singh"}
         today = make_config().today()
         chat_data: dict[str, Any] = {}
         seed_chat_list(chat_data, {"5c": make_state_task("5c", "buy milk")}, day=today)
-        long_name = "x" * 149  # rest = "5c " + name → but split takes id then rest
-        fakes = build_fakes(args=["5c", long_name], chat_data=chat_data)
+        name = "x" * 149
+        fakes = build_fakes(args=["5c", name], chat_data=chat_data)
         run(AssignCommand(make_config(), todoist, PROJECT), fakes)
-        # 149-char name passes the 150 cap → lookup attempted (not "too long")
-        assert fakes.bot.sent_texts() != ["Assignee too long — max 150 characters"]
+        # 149-char name passes the 150 cap → the lookup actually ran;
+        # it then fails to resolve, which is the expected soft reply.
+        assert todoist.method_calls("collaborator_id_for_name") == [
+            ("collaborator_id_for_name", "p1", name)
+        ]
+        assert any("not found" in t for t in fakes.bot.sent_texts())
 
     def test_not_found_is_soft_reply(self):
         todoist = make_todoist()
@@ -618,10 +626,15 @@ class TestDue:
         todoist.update_task_due_result = sdk_task(content="buy milk", due_date=today)
         chat_data: dict[str, Any] = {}
         seed_chat_list(chat_data, {"5c": make_state_task("5c", "buy milk")}, day=today)
-        fakes = build_fakes(args=["5c", "x" * 149], chat_data=chat_data)
+        when = "x" * 149
+        fakes = build_fakes(args=["5c", when], chat_data=chat_data)
         run(DueCommand(make_config(), todoist, PROJECT), fakes)
-        # 149-char rest passes the 150 cap → lookup attempted (not "too long")
-        assert fakes.bot.sent_texts() != ["Date string too long — max 150 characters"]
+        # 149-char string passes the 150 cap → Todoist is actually called
+        # and the normal success reply follows.
+        assert todoist.method_calls("update_task_due") == [
+            ("update_task_due", "5c", when)
+        ]
+        assert any(t.startswith("📅 buy milk → ") for t in fakes.bot.sent_texts())
 
     def test_completed_is_rejected(self):
         todoist = make_todoist()
@@ -849,3 +862,28 @@ class TestRegistration:
             "project",
         }
         assert expected <= commands_registered
+
+    @staticmethod
+    def _handler_for(application: Any, name: str) -> Any:
+        for handler in application.handlers.get(0, []):
+            if name in (getattr(handler, "commands", None) or ()):
+                return handler
+        raise AssertionError(f"no handler registered for /{name}")
+
+    @pytest.mark.parametrize(
+        ("name", "days"), [("today", 0), ("tomorrow", 1), ("week", 6)]
+    )
+    def test_list_handler_wiring_uses_expected_days(self, name: str, days: int) -> None:
+        # Drive the registered handler, not a hand-built ListCommand:
+        # this is the only place that can catch a wrong days value in
+        # build_application's /today, /tomorrow or /week registration.
+        cfg = make_config()
+        todoist = make_todoist()
+        fakes = build_fakes()
+        application = build_application(cfg, PROJECT, todoist)
+        handler = self._handler_for(application, name)
+        asyncio.run(handler.callback(fakes.update, fakes.context))
+        cutoff = cfg.today() + timedelta(days=days)
+        assert todoist.method_calls("tasks_due_by") == [
+            ("tasks_due_by", "p1", str(cutoff))
+        ]
