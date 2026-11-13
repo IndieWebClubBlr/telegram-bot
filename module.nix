@@ -1,4 +1,4 @@
-# NixOS module for the IWCB Telegram Bot.
+# NixOS module for the Todoist Telegram Bot.
 # Source: https://github.com/IndieWebClubBlr/telegram-bot
 {
   config,
@@ -8,7 +8,7 @@
 }:
 
 let
-  cfg = config.services.iwcb-telegram-bot;
+  cfg = config.services.todoist-telegram-bot;
 
   # Instance names become part of the systemd unit name, so keep them
   # to characters systemd accepts in a unit name.
@@ -20,7 +20,7 @@ let
   # time zone pattern) keep every value free of newlines and spaces.
   optionsEnvFile =
     name: inst:
-    pkgs.writeText "iwcb-options-${name}.env" (
+    pkgs.writeText "todoist-telegram-bot-options-${name}.env" (
       ''
         TODOIST_PROJECT_ID=${inst.projectId}
         ALLOWED_CHAT_IDS=${lib.concatMapStringsSep "," toString inst.allowedChatIds}
@@ -40,7 +40,7 @@ let
     );
 
   mkService = name: inst: {
-    description = "IWCB Telegram Bot (${name})";
+    description = "Todoist Telegram Bot (${name})";
     wantedBy = [ "multi-user.target" ];
     wants = [ "network-online.target" ];
     after = [ "network-online.target" ];
@@ -55,7 +55,7 @@ let
     };
 
     serviceConfig = {
-      ExecStart = "${inst.package}/bin/iwcb-telegram-bot";
+      ExecStart = "${inst.package}/bin/todoist-telegram-bot";
       # systemd reads EnvironmentFile entries in order and later files
       # override earlier ones (and all files override Environment=), so
       # the generated options file must come last.
@@ -114,11 +114,11 @@ let
   };
 in
 {
-  options.services.iwcb-telegram-bot.instances = lib.mkOption {
+  options.services.todoist-telegram-bot.instances = lib.mkOption {
     type = lib.types.attrsOf (
       lib.types.submodule {
         options = {
-          enable = lib.mkEnableOption "this instance of the IWCB Telegram Bot";
+          enable = lib.mkEnableOption "this instance of the Todoist Telegram Bot";
 
           package = lib.mkOption {
             type = lib.types.package;
@@ -248,7 +248,7 @@ in
 
           environmentFile = lib.mkOption {
             type = lib.types.str;
-            example = "/run/secrets-rendered/iwcb-club.env";
+            example = "/run/secrets-rendered/todoist-club.env";
             description = ''
               Absolute path to a systemd EnvironmentFile providing this
               instance's TELEGRAM_BOT_TOKEN and TODOIST_API_TOKEN, e.g. a
@@ -268,7 +268,7 @@ in
     default = { };
     description = ''
       Named bot instances. Each enabled instance runs as its own hardened
-      systemd service, iwcb-telegram-bot-<name>, with its own Telegram bot
+      systemd service, todoist-telegram-bot-<name>, with its own Telegram bot
       token, Todoist project and allowed chats.
     '';
   };
@@ -278,16 +278,16 @@ in
       name:
       let
         inst = cfg.instances.${name};
-        prefix = "services.iwcb-telegram-bot.instances.${name}";
+        prefix = "services.todoist-telegram-bot.instances.${name}";
       in
       [
         {
           assertion = builtins.match instanceNamePattern name != null;
-          message = "services.iwcb-telegram-bot.instances names must match ${instanceNamePattern} (they become part of the systemd unit name): ${name}";
+          message = "services.todoist-telegram-bot.instances names must match ${instanceNamePattern} (they become part of the systemd unit name): ${name}";
         }
         {
           assertion = lib.hasPrefix "/" inst.environmentFile;
-          message = ''${prefix}.environmentFile must be an absolute path string, e.g. "/run/secrets-rendered/iwcb-${name}.env"'';
+          message = ''${prefix}.environmentFile must be an absolute path string, e.g. "/run/secrets-rendered/todoist-${name}.env"'';
         }
         {
           assertion = lib.all (key: !(lib.hasInfix ";" key || lib.hasInfix "=" key)) (
@@ -299,7 +299,7 @@ in
     ) (lib.attrNames cfg.instances);
 
     systemd.services = lib.mapAttrs' (
-      name: inst: lib.nameValuePair "iwcb-telegram-bot-${name}" (mkService name inst)
+      name: inst: lib.nameValuePair "todoist-telegram-bot-${name}" (mkService name inst)
     ) (lib.filterAttrs (_: inst: inst.enable) cfg.instances);
   };
 }

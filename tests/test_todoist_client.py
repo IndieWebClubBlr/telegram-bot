@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 from todoist_api_python.models import Deadline, Due
 
-from iwcb_bot.todoist_client import _project_token, effective_day
+from todoist_bot.todoist_client import _project_token, effective_day
 
 _KOLKATA = ZoneInfo("Asia/Kolkata")  # UTC+5:30
 _UTC = timezone.utc

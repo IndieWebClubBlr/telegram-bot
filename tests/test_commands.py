@@ -17,8 +17,8 @@ from typing import Any
 import pytest
 from telegram.error import TelegramError
 
-from iwcb_bot.bot import build_application
-from iwcb_bot.commands import (
+from todoist_bot.bot import build_application
+from todoist_bot.commands import (
     AddCommand,
     AssignCommand,
     DoneCommand,
@@ -31,9 +31,9 @@ from iwcb_bot.commands import (
     UnknownCommand,
     UndoCommand,
 )
-from iwcb_bot.messaging import LIST_CMDS, MINE_TITLE
-from iwcb_bot.state import get_chat_list, get_mine_lists, get_tasks
-from iwcb_bot.todoist_client import TodoistError
+from todoist_bot.messaging import LIST_CMDS, MINE_TITLE
+from todoist_bot.state import get_chat_list, get_mine_lists, get_tasks
+from todoist_bot.todoist_client import TodoistError
 
 from helpers import (
     PROJECT,

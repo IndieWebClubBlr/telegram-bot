@@ -6,7 +6,7 @@ default:
 
 # Run the bot from src/ with credentials from the environment.
 run:
-    python -m iwcb_bot
+    python -m todoist_bot
 
 # Format Python and Nix sources.
 fmt:
@@ -43,7 +43,7 @@ smoke:
     #!/usr/bin/env bash
     set -euo pipefail
     status=0
-    env -i ./result/bin/iwcb-telegram-bot || status=$?
+    env -i ./result/bin/todoist-telegram-bot || status=$?
     if [[ $status -ne 2 ]]; then
         echo "expected exit 2, got $status" >&2
         exit 1

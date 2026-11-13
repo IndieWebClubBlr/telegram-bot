@@ -21,23 +21,23 @@ let
           default = [ ];
         };
 
-        config.services.iwcb-telegram-bot.instances = {
+        config.services.todoist-telegram-bot.instances = {
           club = {
             enable = true;
-            environmentFile = "/run/secrets-rendered/iwcb-club.env";
+            environmentFile = "/run/secrets-rendered/todoist-club.env";
             projectId = "aaa";
             allowedChatIds = [ 1 ];
             timeZone = "Asia/Kolkata";
           };
           personal = {
             enable = true;
-            environmentFile = "/run/secrets-rendered/iwcb-personal.env";
+            environmentFile = "/run/secrets-rendered/todoist-personal.env";
             projectId = "bbb";
             allowedChatIds = [ 2 ];
           };
           paused = {
             enable = false;
-            environmentFile = "/run/secrets-rendered/iwcb-paused.env";
+            environmentFile = "/run/secrets-rendered/todoist-paused.env";
             projectId = "ccc";
             allowedChatIds = [ 3 ];
           };
@@ -49,21 +49,23 @@ let
   services = eval.config.systemd.services;
   envFiles = name: map toString services.${name}.serviceConfig.EnvironmentFile;
 in
-assert services ? iwcb-telegram-bot-club;
-assert services ? iwcb-telegram-bot-personal;
+assert services ? todoist-telegram-bot-club;
+assert services ? todoist-telegram-bot-personal;
 # enable = false produces no unit
-assert !(services ? iwcb-telegram-bot-paused);
+assert !(services ? todoist-telegram-bot-paused);
 # Each unit reads its own secrets file first and its own options file second.
-assert lib.head (envFiles "iwcb-telegram-bot-club") == "/run/secrets-rendered/iwcb-club.env";
+assert lib.head (envFiles "todoist-telegram-bot-club") == "/run/secrets-rendered/todoist-club.env";
 assert
-  lib.head (envFiles "iwcb-telegram-bot-personal") == "/run/secrets-rendered/iwcb-personal.env";
-assert lib.length (envFiles "iwcb-telegram-bot-club") == 2;
+  lib.head (envFiles "todoist-telegram-bot-personal") == "/run/secrets-rendered/todoist-personal.env";
+assert lib.length (envFiles "todoist-telegram-bot-club") == 2;
 # The unit actually runs the bot package (this forces the package default).
-assert lib.hasInfix "/bin/iwcb-telegram-bot"
-  services.iwcb-telegram-bot-club.serviceConfig.ExecStart;
-assert lib.any (p: lib.hasInfix "iwcb-options-club.env" p) (envFiles "iwcb-telegram-bot-club");
-assert lib.any (p: lib.hasInfix "iwcb-options-personal.env" p) (
-  envFiles "iwcb-telegram-bot-personal"
+assert lib.hasInfix "/bin/todoist-telegram-bot"
+  services.todoist-telegram-bot-club.serviceConfig.ExecStart;
+assert lib.any (p: lib.hasInfix "todoist-telegram-bot-options-club.env" p) (
+  envFiles "todoist-telegram-bot-club"
+);
+assert lib.any (p: lib.hasInfix "todoist-telegram-bot-options-personal.env" p) (
+  envFiles "todoist-telegram-bot-personal"
 );
 # Three assertions per declared instance, all satisfied.
 assert lib.length eval.config.assertions == 9;

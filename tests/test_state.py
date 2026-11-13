@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from iwcb_bot.state import (
+from todoist_bot.state import (
     Ambiguous,
     Applied,
     Assign,

@@ -1,4 +1,4 @@
-"""Command classes for the IWCB Telegram bot.
+"""Command classes for the Todoist Telegram bot.
 
 Every Telegram command is a _Command (or _ListAction) built with the
 same constructor triple — (cfg, todoist, project) — and registered via

@@ -1,9 +1,9 @@
-# IWCB Telegram Bot
+# Todoist Telegram Bot
 
-IWCB Telegram Bot — a Telegram bot for IWCB. Task management is backed by
-Todoist: the bot operates on one configured project. Vanilla Nix packaging
-plus a NixOS module (no flakes) — the module is imported by your machine's
-NixOS configuration, which is also where secrets live (e.g. via sops-nix).
+A Telegram bot for managing a Todoist project. The bot operates on one
+configured project. Vanilla Nix packaging plus a NixOS module (no flakes) —
+the module is imported by your machine's NixOS configuration, which is also
+where secrets live (e.g. via sops-nix).
 
 ## Commands
 
@@ -112,7 +112,7 @@ export TODOIST_API_TOKEN=0123456789abcdef...
 export TODOIST_PROJECT_ID="<your-project-id>"
 export ALLOWED_CHAT_IDS=123456789
 export TIMEZONE=Asia/Kolkata
-python -m iwcb_bot
+python -m todoist_bot
 ```
 
 The shell provides Python with all dependencies on `PYTHONPATH`, plus the
@@ -141,14 +141,14 @@ would otherwise be copied into the world-readable Nix store — but outside is
 safer still):
 
 ```bash
-set -a; source ~/secrets/iwcb.env; set +a
+set -a; source ~/secrets/todoist.env; set +a
 ```
 
 ## Building
 
 ```bash
 just build       # nix-build; runs pytest in the sandbox
-./result/bin/iwcb-telegram-bot   # run the built package (needs env vars)
+./result/bin/todoist-telegram-bot   # run the built package (needs env vars)
 just smoke       # assert the no-config exit code is 2
 ```
 
@@ -156,8 +156,8 @@ just smoke       # assert the no-config exit code is 2
 
 Pin this repo with [niv](https://github.com/nmattia/niv) in your NixOS config
 repo (`niv add <this-repo-url>`), then import the module. Each instance is a
-named entry under `services.iwcb-telegram-bot.instances` and becomes its own
-hardened systemd service, `iwcb-telegram-bot-<name>`:
+named entry under `services.todoist-telegram-bot.instances` and becomes its own
+hardened systemd service, `todoist-telegram-bot-<name>`:
 
 ```nix
 { config, ... }:
@@ -165,21 +165,21 @@ let
   sources = import ./nix/sources.nix;
 in
 {
-  imports = [ "${sources.iwcb-telegram-bot}/module.nix" ];
+  imports = [ "${sources.todoist-telegram-bot}/module.nix" ];
 
-  services.iwcb-telegram-bot.instances = {
+  services.todoist-telegram-bot.instances = {
     club = {
       enable = true;
       projectId = "<club-project-id>";
       allowedChatIds = [ 123456789 ];
       timeZone = "Asia/Kolkata";
-      environmentFile = config.sops.templates."iwcb-club.env".path;
+      environmentFile = config.sops.templates."todoist-club.env".path;
     };
     personal = {
       enable = true;
       projectId = "<personal-project-id>";
       allowedChatIds = [ 987654321 ];
-      environmentFile = config.sops.templates."iwcb-personal.env".path;
+      environmentFile = config.sops.templates."todoist-personal.env".path;
     };
   };
 }
@@ -212,29 +212,29 @@ sops.secrets.club_todoist_api_token = { };
 sops.secrets.personal_telegram_bot_token = { };
 sops.secrets.personal_todoist_api_token = { };
 
-sops.templates."iwcb-club.env".content = ''
+sops.templates."todoist-club.env".content = ''
   TELEGRAM_BOT_TOKEN=${config.sops.placeholder.club_telegram_bot_token}
   TODOIST_API_TOKEN=${config.sops.placeholder.club_todoist_api_token}
 '';
 
-sops.templates."iwcb-personal.env".content = ''
+sops.templates."todoist-personal.env".content = ''
   TELEGRAM_BOT_TOKEN=${config.sops.placeholder.personal_telegram_bot_token}
   TODOIST_API_TOKEN=${config.sops.placeholder.personal_todoist_api_token}
 '';
 
-services.iwcb-telegram-bot.instances = {
+services.todoist-telegram-bot.instances = {
   club = {
     enable = true;
     projectId = "<club-project-id>";
     allowedChatIds = [ 123456789 ];
     timeZone = "Asia/Kolkata";
-    environmentFile = config.sops.templates."iwcb-club.env".path;
+    environmentFile = config.sops.templates."todoist-club.env".path;
   };
   personal = {
     enable = true;
     projectId = "<personal-project-id>";
     allowedChatIds = [ 987654321 ];
-    environmentFile = config.sops.templates."iwcb-personal.env".path;
+    environmentFile = config.sops.templates."todoist-personal.env".path;
   };
 };
 ```

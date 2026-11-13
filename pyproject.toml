@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "iwcb-telegram-bot"
-version = "0.1.0"
-description = "IWCB Telegram Bot — a Telegram bot for IWCB"
+name = "todoist-telegram-bot"
+version = "1.0.0"
+description = "A Telegram bot for managing a Todoist project"
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,10 +17,10 @@ dependencies = [
 ]
 
 [project.scripts]
-iwcb-telegram-bot = "iwcb_bot.__main__:main"
+todoist-telegram-bot = "todoist_bot.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/iwcb_bot"]
+packages = ["src/todoist_bot"]
 
 [tool.black]
 target-version = ["py310"]

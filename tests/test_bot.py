@@ -6,8 +6,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
-from iwcb_bot.bot import _send_morning_list, next_announce
-from iwcb_bot.state import get_chat_list, put_tasks
+from todoist_bot.bot import _send_morning_list, next_announce
+from todoist_bot.state import get_chat_list, put_tasks
 
 from helpers import (
     PROJECT,

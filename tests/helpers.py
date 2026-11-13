@@ -29,17 +29,17 @@ from telegram.ext import ContextTypes
 from todoist_api_python.models import Project
 from todoist_api_python.models import Task as SdkTask
 
-from iwcb_bot.config import Config
-from iwcb_bot.messaging import TelegramBot
-from iwcb_bot.state import Task, TaskList, put_tasks, set_chat_list
-from iwcb_bot.todoist_client import DueTask, TodoistClient
+from todoist_bot.config import Config
+from todoist_bot.messaging import TelegramBot
+from todoist_bot.state import Task, TaskList, put_tasks, set_chat_list
+from todoist_bot.todoist_client import DueTask, TodoistClient
 
 # A plausible-looking but fake token (matches Telegram's digits:chars
 # shape so Application.builder().token() accepts it offline).
 DUMMY_TG_TOKEN = "1000000000:" + "A" * 35
 
 PROJECT = cast(
-    Project, SimpleNamespace(id="p1", name="IWCB", url="https://todoist.com/p1")
+    Project, SimpleNamespace(id="p1", name="Todoist", url="https://todoist.com/p1")
 )
 
 
@@ -421,7 +421,7 @@ def sdk_task(
 
 def run(cmd: Any, fakes: Fakes) -> None:
     """Drive a command through its guarded callback in a fresh loop."""
-    from iwcb_bot.commands import command_callback
+    from todoist_bot.commands import command_callback
 
     callback = command_callback(cmd)
     asyncio.run(callback(fakes.update, fakes.context))

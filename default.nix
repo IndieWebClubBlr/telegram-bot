@@ -7,8 +7,8 @@ let
   py = pkgs.python3.pkgs;
 in
 py.buildPythonApplication {
-  pname = "iwcb-telegram-bot";
-  version = "0.1.0";
+  pname = "todoist-telegram-bot";
+  version = "1.0.0";
   pyproject = true;
 
   # Allowlist: only ship what the build needs.  A filename denylist
@@ -49,19 +49,19 @@ py.buildPythonApplication {
   ];
 
   pythonImportsCheck = [
-    "iwcb_bot"
-    "iwcb_bot.bot"
-    "iwcb_bot.commands"
-    "iwcb_bot.config"
-    "iwcb_bot.messaging"
-    "iwcb_bot.state"
-    "iwcb_bot.todoist_client"
+    "todoist_bot"
+    "todoist_bot.bot"
+    "todoist_bot.commands"
+    "todoist_bot.config"
+    "todoist_bot.messaging"
+    "todoist_bot.state"
+    "todoist_bot.todoist_client"
   ];
 
   meta = {
-    description = "IWCB Telegram Bot — a Telegram bot for IWCB";
+    description = "A Telegram bot for managing a Todoist project";
     homepage = "https://github.com/IndieWebClubBlr/telegram-bot";
     license = lib.licenses.mit;
-    mainProgram = "iwcb-telegram-bot";
+    mainProgram = "todoist-telegram-bot";
   };
 }

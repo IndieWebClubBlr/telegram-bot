@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from iwcb_bot.config import Config, ConfigError
+from todoist_bot.config import Config, ConfigError
 
 from helpers import make_config as make_dataclass_config
 

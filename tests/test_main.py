@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from iwcb_bot.__main__ import _redact
+from todoist_bot.__main__ import _redact
 
 TOKEN = "123456:secret-tg-token"
 TODOIST = "0123456789abcdef-secret-todoist"

@@ -5,7 +5,7 @@ from datetime import date
 import pytest
 from telegram.constants import ChatType, ReactionEmoji
 
-from iwcb_bot.messaging import (
+from todoist_bot.messaging import (
     BODY_LIMIT,
     NBSP,
     Status,
@@ -23,7 +23,7 @@ from iwcb_bot.messaging import (
     render_text,
     status_emoji,
 )
-from iwcb_bot.state import Task
+from todoist_bot.state import Task
 
 from helpers import make_config
 

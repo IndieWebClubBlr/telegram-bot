@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from iwcb_bot import messaging
+from todoist_bot import messaging
 
 
 @pytest.fixture(autouse=True)
