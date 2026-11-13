@@ -123,6 +123,7 @@ black src tests            # format Python
 basedpyright --pythonpath "$(command -v python)"   # type-check Python
 python -m pytest -q        # run the test suite
 nixfmt *.nix               # format Nix files
+nix-instantiate --eval --strict ./module-test.nix   # evaluate the NixOS module
 ```
 
 Tip: keep tokens out of shell history with an env file kept **outside the
@@ -144,7 +145,9 @@ nix-build
 ## Deploying on NixOS
 
 Pin this repo with [niv](https://github.com/nmattia/niv) in your NixOS config
-repo (`niv add <this-repo-url>`), then import the module:
+repo (`niv add <this-repo-url>`), then import the module. Each instance is a
+named entry under `services.iwcb-telegram-bot.instances` and becomes its own
+hardened systemd service, `iwcb-telegram-bot-<name>`:
 
 ```nix
 { config, ... }:
@@ -154,53 +157,84 @@ in
 {
   imports = [ "${sources.iwcb-telegram-bot}/module.nix" ];
 
-  services.iwcb-telegram-bot = {
-    enable = true;
-    projectId = "<your-project-id>";
-    allowedChatIds = [ 123456789 ];
-    timeZone = "Asia/Kolkata";
-    environmentFile = config.sops.templates."iwcb-bot.env".path;
+  services.iwcb-telegram-bot.instances = {
+    club = {
+      enable = true;
+      projectId = "<club-project-id>";
+      allowedChatIds = [ 123456789 ];
+      timeZone = "Asia/Kolkata";
+      environmentFile = config.sops.templates."iwcb-club.env".path;
+    };
+    personal = {
+      enable = true;
+      projectId = "<personal-project-id>";
+      allowedChatIds = [ 987654321 ];
+      environmentFile = config.sops.templates."iwcb-personal.env".path;
+    };
   };
 }
 ```
 
-`projectId`, `allowedChatIds` and `environmentFile` are required options —
-`nixos-rebuild` fails at evaluation time if any is missing. `timeZone` is
+`enable` defaults to `false`: an instance does nothing until you set it to
+`true`. Within each instance, `projectId`, `allowedChatIds` and
+`environmentFile` are required options — `nixos-rebuild` fails at evaluation
+time if any is missing, even while the instance is disabled. `timeZone` is
 optional (null = the server's time zone) but should usually be set: the
 server and the bot's users are often in different time zones, and "today"
 means the users' today.
 
+Instances are independent processes with no shared on-disk state. They can
+share a Todoist account as long as each uses its own `projectId`, but each
+needs its own Telegram bot token: Telegram allows only one long-polling
+consumer per bot, so two units sharing a token fight over updates.
+
 ### Secrets with sops-nix
 
-This repo contains no secrets. The importing repo decrypts them and renders a
-systemd environment file (inside the same module as above — the
-`{ config, ... }:` header is what makes `config.sops` available):
+This repo contains no secrets. The importing repo decrypts them and renders
+one systemd environment file per instance (inside the same module as above —
+the `{ config, ... }:` header is what makes `config.sops` available):
 
 ```nix
 sops.defaultSopsFile = ./secrets.yaml;
 
-sops.secrets.telegram_bot_token = { };
-sops.secrets.todoist_api_token = { };
+sops.secrets.club_telegram_bot_token = { };
+sops.secrets.club_todoist_api_token = { };
+sops.secrets.personal_telegram_bot_token = { };
+sops.secrets.personal_todoist_api_token = { };
 
-sops.templates."iwcb-bot.env".content = ''
-  TELEGRAM_BOT_TOKEN=${config.sops.placeholder.telegram_bot_token}
-  TODOIST_API_TOKEN=${config.sops.placeholder.todoist_api_token}
+sops.templates."iwcb-club.env".content = ''
+  TELEGRAM_BOT_TOKEN=${config.sops.placeholder.club_telegram_bot_token}
+  TODOIST_API_TOKEN=${config.sops.placeholder.club_todoist_api_token}
 '';
 
-services.iwcb-telegram-bot = {
-  enable = true;
-  projectId = "<your-project-id>";
-  allowedChatIds = [ 123456789 ];
-  timeZone = "Asia/Kolkata";
-  environmentFile = config.sops.templates."iwcb-bot.env".path;
+sops.templates."iwcb-personal.env".content = ''
+  TELEGRAM_BOT_TOKEN=${config.sops.placeholder.personal_telegram_bot_token}
+  TODOIST_API_TOKEN=${config.sops.placeholder.personal_todoist_api_token}
+'';
+
+services.iwcb-telegram-bot.instances = {
+  club = {
+    enable = true;
+    projectId = "<club-project-id>";
+    allowedChatIds = [ 123456789 ];
+    timeZone = "Asia/Kolkata";
+    environmentFile = config.sops.templates."iwcb-club.env".path;
+  };
+  personal = {
+    enable = true;
+    projectId = "<personal-project-id>";
+    allowedChatIds = [ 987654321 ];
+    environmentFile = config.sops.templates."iwcb-personal.env".path;
+  };
 };
 ```
 
-The environment file must contain only the two tokens. If it also sets
-`TODOIST_PROJECT_ID`, `ALLOWED_CHAT_IDS` or `TIMEZONE`, the module options
-still win: the module writes them to a second environment file that systemd
-reads *after* this one (later `EnvironmentFile=` entries override earlier
-ones, and all of them override `Environment=`).
+Each environment file must contain only that instance's two tokens. If it
+also sets `TODOIST_PROJECT_ID`, `ALLOWED_CHAT_IDS` or `TIMEZONE`, the module
+options still win: the module writes them to a second, per-instance
+environment file that systemd reads *after* this one (later
+`EnvironmentFile=` entries override earlier ones, and all of them override
+`Environment=`).
 
 ### systemd hardening
 
