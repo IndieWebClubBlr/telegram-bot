@@ -46,31 +46,31 @@ display over a confident lie.
 
 ```
                     Telegram (long polling)
-                              │ updates
-                              ▼
-┌──────────────────────────────────────────────────────────┐
-│ bot.py         PTB Application, auth filter, lifecycle,   │
-│                morning-announce loop, top-level on_error  │
-└───────────────┬──────────────────────────────────────────┘
-                │ commands
-                ▼
-┌──────────────────────────────────────────────────────────┐
-│ commands.py    command classes + shared handler shell:    │
-│                guards, typing, chat lock, error replies   │
-└───────┬───────────────────────┬──────────────────────────┘
-        │                       │
-        ▼                       ▼
-┌────────────────────┐  ┌───────────────────────────────────┐
-│ state.py           │  │ messaging.py                      │
-│ pure in-memory     │  │ Telegram effects: replies,        │
-│ state + event FSM  │  │ reactions, rendering, list edits  │
-└────────────────────┘  └──────────────┬────────────────────┘
-                                       │
-                                       ▼
-                        ┌───────────────────────────────────┐
-                        │ todoist_client.py                 │
-                        │ ABC + HTTP implementation         │
-                        └───────────────────────────────────┘
+                              | updates
+                              v
++----------------------------------------------------------+
+| bot.py         PTB Application, auth filter, lifecycle,   |
+|                morning-announce loop, top-level on_error  |
++---------------+------------------------------------------+
+                | commands
+                v
++----------------------------------------------------------+
+| commands.py    command classes + shared handler shell:    |
+|                guards, typing, chat lock, error replies   |
++-------+-----------------------+--------------------------+
+        |                       |
+        v                       v
++--------------------+  +-----------------------------------+
+| state.py           |  | messaging.py                      |
+| pure in-memory     |  | Telegram effects: replies,        |
+| state + event FSM  |  | reactions, rendering, list edits  |
++--------------------+  +--------------+--------------------+
+                                       |
+                                       v
+                        +-----------------------------------+
+                        | todoist_client.py                 |
+                        | ABC + HTTP implementation         |
+                        +-----------------------------------+
 ```
 
 Module responsibilities:
@@ -120,6 +120,12 @@ or until it is replaced; after a restart, users run a list command again. This
 avoids a schema, migrations, backups, and a second source of truth. The cost is
 explicit in the UX: `/done` only matches tasks in a currently displayed list.
 
+Lists are also per chat, and the bot does not fan mutations out across chats.
+A task completed in one chat can still look active in another chat's older
+list until that list is refreshed; acting on the stale line repeats the
+remote write (for a recurring task, that can advance the series again).
+Refreshing the list is the recovery path.
+
 ### Short ids are scoped to what was displayed
 
 Todoist ids are long; Telegram users type short suffixes. The bot derives the
@@ -164,11 +170,13 @@ revisiting state locking, list edits, and the morning loop together.
 
 ### Failures are split by kind
 
-- Configuration errors (bad env, unknown project, token rejected) exit 2. The
-  NixOS unit sets `RestartPreventExitStatus = 2`, so a typo does not produce a
-  restart loop.
+- Configuration errors (bad env, unknown project, a bot token Telegram
+  rejects) exit 2. The NixOS unit sets `RestartPreventExitStatus = 2`, so a
+  typo does not produce a restart loop.
 - Startup failures that may be transient (Todoist/Telegram unreachable) exit 1
-  and are retried by systemd.
+  and are retried by systemd. A Todoist token rejection is not distinguishable
+  from another Todoist startup failure, so it exits 1 and relies on the unit's
+  start limit instead of restarting forever.
 - Runtime command failures keep the bot alive and answer with a distinct
   failure reply. Telegram send failures say the action may have happened
   remotely and point at a list command.
@@ -208,7 +216,9 @@ chat ids; everything else has a documented default.
 
 The NixOS module turns non-secret options into a generated environment file and
 lists it *after* the secrets file, so systemd's later-file-wins rule makes the
-options authoritative. The secrets file supplies only the tokens. Assignee
+options authoritative for project id and chat ids. `TIMEZONE` is written only
+when the option is set, so a null `timeZone` leaves the secrets file free to
+supply it. The secrets file supplies only the tokens. Assignee
 mentions can be supplied by either; keeping them in secrets avoids publishing
 names and handles into the Nix store.
 

@@ -157,7 +157,10 @@ just smoke       # assert the no-config exit code is 2
 ## Deploying on NixOS
 
 Pin this repo with [niv](https://github.com/nmattia/niv) in your NixOS config
-repo (`niv add <this-repo-url>`), then import the module. Each instance is a
+repo (`niv add <this-repo-url> --name todoist-telegram-bot`), then import the
+module. The `--name` matters: niv otherwise infers the source name from the
+repository name (`telegram-bot`), and the import below would not resolve. Each
+instance is a
 named entry under `services.todoist-telegram-bot.instances` and becomes its own
 hardened systemd service, `todoist-telegram-bot-<name>`:
 
@@ -242,11 +245,13 @@ services.todoist-telegram-bot.instances = {
 ```
 
 Each environment file needs only that instance's two tokens. If it also sets
-`TODOIST_PROJECT_ID`, `ALLOWED_CHAT_IDS` or `TIMEZONE`, the module options
-still win: the module writes them to a second, per-instance
-environment file that systemd reads *after* this one (later
-`EnvironmentFile=` entries override earlier ones, and all of them override
-`Environment=`).
+`TODOIST_PROJECT_ID`, `ALLOWED_CHAT_IDS` or `TIMEZONE`, the module writes its
+options to a second, per-instance environment file that systemd reads *after*
+this one (later `EnvironmentFile=` entries override earlier ones, and all of
+them override `Environment=`). `TODOIST_PROJECT_ID` and `ALLOWED_CHAT_IDS` are
+always written, so the options win. `TIMEZONE` is written only when `timeZone`
+is set; with the default `timeZone = null`, a `TIMEZONE` in the environment
+file is used.
 
 ### systemd hardening
 
