@@ -67,7 +67,7 @@ assert lib.any (p: lib.hasInfix "todoist-telegram-bot-options-club.env" p) (
 assert lib.any (p: lib.hasInfix "todoist-telegram-bot-options-personal.env" p) (
   envFiles "todoist-telegram-bot-personal"
 );
-# Three assertions per declared instance, all satisfied.
-assert lib.length eval.config.assertions == 9;
+# Four assertions per declared instance, all satisfied.
+assert lib.length eval.config.assertions == 12;
 assert lib.all (a: a.assertion) eval.config.assertions;
 true

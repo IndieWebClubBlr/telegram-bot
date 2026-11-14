@@ -157,7 +157,8 @@ in
               (TIMEZONE). The server and the bot's users are often in
               different time zones, so this should usually be the users'
               time zone rather than the server's. When null, the bot falls
-              back to the server's local time zone.
+              back to the server's local offset at startup (it does not
+              follow daylight-saving transitions).
             '';
           };
 
@@ -257,9 +258,11 @@ in
               Nix store. Every instance needs a distinct bot token:
               Telegram allows only one long-polling consumer per bot.
               Non-secret settings come from the options above and are
-              written to a second environment file listed after this one,
-              so the options win even if this file also sets
-              TODOIST_PROJECT_ID, ALLOWED_CHAT_IDS or TIMEZONE.
+              written to a second environment file listed after this one.
+              TODOIST_PROJECT_ID and ALLOWED_CHAT_IDS are always written,
+              so the options win; TIMEZONE is written only when timeZone
+              is set, so a TIMEZONE in this file is used when timeZone is
+              null (the default).
             '';
           };
         };
@@ -290,10 +293,14 @@ in
           message = ''${prefix}.environmentFile must be an absolute path string, e.g. "/run/secrets-rendered/todoist-${name}.env"'';
         }
         {
-          assertion = lib.all (key: !(lib.hasInfix ";" key || lib.hasInfix "=" key)) (
-            lib.attrNames inst.assigneeMentions
-          );
-          message = ''${prefix}.assigneeMentions keys must not contain ";" or "=" (they would break the ASSIGNEE_MENTIONS env encoding)'';
+          assertion = lib.all (
+            key: !(lib.hasInfix ";" key || lib.hasInfix "=" key) && builtins.match ".*[\n\r].*" key == null
+          ) (lib.attrNames inst.assigneeMentions);
+          message = ''${prefix}.assigneeMentions keys must not contain ";", "=" or line breaks (they would break the ASSIGNEE_MENTIONS env encoding)'';
+        }
+        {
+          assertion = !inst.enable || inst.allowedChatIds != [ ];
+          message = "${prefix}.allowedChatIds must not be empty when the instance is enabled";
         }
       ]
     ) (lib.attrNames cfg.instances);
