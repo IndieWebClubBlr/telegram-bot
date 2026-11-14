@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, tzinfo
 from typing import TypeVar
@@ -93,6 +93,20 @@ class TodoistClient(ABC):
     @abstractmethod
     async def collaborator_name(self, project_id: str, assignee_id: str) -> str | None:
         """Display name for a Todoist assignee id, or None if unresolvable."""
+
+    async def collaborator_names(
+        self, project_id: str, assignee_ids: Iterable[str]
+    ) -> dict[str, str | None]:
+        """Resolve several assignee ids in one go.
+
+        The default keeps simple clients (and test fakes) working by
+        delegating per id; the HTTP client overrides it so a failed
+        fetch is attempted once, not once per task in the list.
+        """
+        return {
+            assignee_id: await self.collaborator_name(project_id, assignee_id)
+            for assignee_id in dict.fromkeys(assignee_ids)
+        }
 
     @abstractmethod
     async def collaborator_id_for_name(self, project_id: str, name: str) -> str | None:
@@ -219,6 +233,43 @@ class HttpTodoistClient(TodoistClient):
             if refreshed:
                 self._collaborator_misses.add(assignee_id)
             return name
+
+    async def collaborator_names(
+        self, project_id: str, assignee_ids: Iterable[str]
+    ) -> dict[str, str | None]:
+        """Batch form of collaborator_name with one fetch per list render.
+
+        A failing initial fetch degrades every id to None after a single
+        attempt (rather than retrying once per task under the chat lock).
+        Unknown ids share one refresh; misses are retired only after a
+        successful refresh, so the next render retries a failed one.
+        """
+        ids = dict.fromkeys(assignee_ids)
+        if not ids:
+            return {}
+        async with self._collaborator_lock:
+            if self._collaborators is None:
+                await self._refresh_collaborators(project_id)
+            if self._collaborators is None:
+                logger.debug("collaborator_names: cache unavailable (%d ids)", len(ids))
+                return dict.fromkeys(ids)
+            missing = {
+                assignee_id
+                for assignee_id in ids
+                if assignee_id not in self._collaborators
+                and assignee_id not in self._collaborator_misses
+            }
+            if missing:
+                refreshed = await self._refresh_collaborators(project_id)
+                if refreshed:
+                    self._collaborator_misses.update(
+                        assignee_id
+                        for assignee_id in missing
+                        if assignee_id not in self._collaborators
+                    )
+            return {
+                assignee_id: self._collaborators.get(assignee_id) for assignee_id in ids
+            }
 
     async def collaborator_id_for_name(self, project_id: str, name: str) -> str | None:
         """Collaborator id whose name casefold-matches `name`, or None.

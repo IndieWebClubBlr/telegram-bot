@@ -382,13 +382,15 @@ async def build_entities(
     collaborator map (fetched once, refreshed on unknown ids) and never
     raises — a failed lookup leaves the assignee blank.
     """
+    assignee_ids = [
+        task.task.assignee_id for task in tasks if task.task.assignee_id is not None
+    ]
+    assignees = await todoist.collaborator_names(project_id, assignee_ids)
     entities: dict[str, Task] = {}
     for task in tasks:
-        assignee: str | None = None
-        if task.task.assignee_id:
-            assignee = await todoist.collaborator_name(
-                project_id, task.task.assignee_id
-            )
+        assignee = (
+            assignees.get(task.task.assignee_id) if task.task.assignee_id else None
+        )
         entities[task.task.id] = Task(
             task_id=task.task.id,
             text=task.task.content,
