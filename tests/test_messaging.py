@@ -74,6 +74,15 @@ class TestChunk:
         with pytest.raises(AssertionError):
             chunk("H" * (_MESSAGE_LIMIT + 1))
 
+    def test_splits_by_utf16_units_for_emoji(self) -> None:
+        # 30 lines of 100 emoji = 3000 code points but 6000 UTF-16
+        # units; chunks must respect Telegram's unit count.
+        text = "\n".join("😀" * 100 for _ in range(30))
+        chunks = chunk(text)
+        assert len(chunks) > 1
+        assert all(len(c.encode("utf-16-le")) // 2 <= _MESSAGE_LIMIT for c in chunks)
+        assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
     def test_divider_glued_to_following_line(self) -> None:
         # Fill a chunk right up to the limit with a divider as its last
         # line; the divider must move down with the first task line.

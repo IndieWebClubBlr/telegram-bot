@@ -249,13 +249,22 @@ def _is_divider_line(line: str) -> bool:
     return line.startswith("<b>") and line.endswith("</b>")
 
 
+def _utf16_len(text: str) -> int:
+    """Length in UTF-16 code units — Telegram's message-length unit.
+
+    Python counts code points, so an emoji-heavy message can pass a
+    code-point check and still exceed Telegram's 4096-unit limit.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 def chunk(text: str) -> list[str]:
-    if len(text) <= _MESSAGE_LIMIT:
+    if _utf16_len(text) <= _MESSAGE_LIMIT:
         return [text]
     chunks: list[str] = []
     current = ""
     for line in text.split("\n"):
-        if current and len(current) + 1 + len(line) > _MESSAGE_LIMIT:
+        if current and _utf16_len(current) + 1 + _utf16_len(line) > _MESSAGE_LIMIT:
             # A section divider as the last line of a message would
             # label the *next* message's tasks — pull it down with the
             # first line of its section when that still fits.
@@ -264,7 +273,7 @@ def chunk(text: str) -> list[str]:
             if (
                 head
                 and _is_divider_line(last)
-                and len(last) + 1 + len(line) <= _MESSAGE_LIMIT
+                and _utf16_len(last) + 1 + _utf16_len(line) <= _MESSAGE_LIMIT
             ):
                 chunks.append(head)
                 current = f"{last}\n{line}"
@@ -277,7 +286,7 @@ def chunk(text: str) -> list[str]:
         chunks.append(current)
     # one_line keeps every line well under the limit; the assert guards
     # against future render changes reintroducing oversized chunks.
-    assert all(len(chunk) <= _MESSAGE_LIMIT for chunk in chunks)
+    assert all(_utf16_len(chunk) <= _MESSAGE_LIMIT for chunk in chunks)
     return chunks
 
 
