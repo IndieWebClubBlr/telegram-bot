@@ -18,6 +18,7 @@ pkgs.mkShell {
     pkgs.basedpyright
     pkgs.just
     pkgs.nixfmt
+    pkgs.ruff
   ];
 
   shellHook = ''

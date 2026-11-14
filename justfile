@@ -28,7 +28,17 @@ test:
 
 # Lint Python.
 lint:
-    nix-shell -p ruff --run 'ruff check --select F401,DTZ --no-cache src tests'
+    ruff check --select F401,DTZ --no-cache src tests
+
+# Verify the release version is identical in all three places.
+version-check:
+    @set -eu; \
+    py=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2); \
+    nix=$(grep -m1 '^  version = ' default.nix | cut -d'"' -f2); \
+    init=$(grep -m1 '__version__' src/todoist_bot/__init__.py | cut -d'"' -f2); \
+    test "$py" = "$nix" && test "$py" = "$init" || { \
+        echo "version mismatch: pyproject=$py default.nix=$nix __init__=$init" >&2; exit 1; \
+    }
 
 # Evaluate the NixOS module (prints true when the instances are wired up).
 module-test:
@@ -51,4 +61,4 @@ smoke:
     echo "smoke ok (exit 2)"
 
 # Run the full battery: formatting, types, tests, lint, module eval, build, smoke.
-check: fmt-check typecheck test lint module-test build smoke
+check: fmt-check typecheck test lint version-check module-test build smoke
