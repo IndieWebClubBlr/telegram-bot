@@ -7,7 +7,7 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from todoist_bot.bot import _send_morning_list, next_announce
-from todoist_bot.state import get_chat_list, put_tasks
+from todoist_bot.state import get_chat_list, get_tasks, put_tasks
 
 from helpers import (
     PROJECT,
@@ -182,7 +182,7 @@ class TestSendMorningList:
         today = cfg.today()
         chat_data: dict[str, Any] = {}
         # a /done landed since the fetch: the record is done locally
-        put_tasks(chat_data, [make_state_task("t1", "buy milk", done=True)])
+        put_tasks(chat_data, [make_state_task("t1", "buy milk", due=today, done=True)])
         application = self._application(chat_data)
         self._send(
             application,
@@ -193,3 +193,41 @@ class TestSendMorningList:
         )
         assert application.bot.calls == []
         assert get_chat_list(chat_data) is None
+
+    def test_next_occurrence_of_locally_done_recurring_is_announced(self) -> None:
+        # Regression: completing yesterday's occurrence stores done=True
+        # with due=yesterday and rolled_due=today.  Today's fetch is the
+        # next occurrence and must still be announced.
+        cfg = make_config()
+        today = cfg.today()
+        yesterday = today - timedelta(days=1)
+        chat_data: dict[str, Any] = {}
+        put_tasks(
+            chat_data,
+            [
+                make_state_task(
+                    "t1",
+                    "water plants",
+                    due=yesterday,
+                    done=True,
+                    recurring=True,
+                    rolled_due=today,
+                )
+            ],
+        )
+        application = self._application(chat_data)
+        self._send(
+            application,
+            FakeTodoist(),
+            [due_task("t1", "water plants", due_date=today, is_recurring=True)],
+            today=today,
+            send_when_empty=True,
+        )
+        texts = application.bot.sent_texts()
+        assert len(texts) == 1
+        assert "water plants" in texts[0]
+        assert "Nothing due today" not in texts[0]
+        stored = get_chat_list(chat_data)
+        assert stored is not None
+        assert stored.task_ids == ["t1"]
+        assert not get_tasks(chat_data)["t1"].done

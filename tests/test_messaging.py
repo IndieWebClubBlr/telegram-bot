@@ -256,6 +256,33 @@ class TestRenderList:
         assert "<s>late</s>" in out
         assert "— due" not in out
 
+    def test_done_recurring_shows_rolled_date_without_show_dates(self) -> None:
+        # README contract: the struck line shows the next-occurrence
+        # date even on /today and the morning list (show_dates=False).
+        rolled = date(2026, 10, 16)
+        items = [
+            Task(
+                task_id="aa",
+                text="water plants",
+                due=TODAY,
+                done=True,
+                recurring=True,
+                rolled_due=rolled,
+            )
+        ]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "<s>water plants</s>" in out
+        assert "— due Fri 16 Oct" in out
+
+    def test_done_recurring_without_rolled_date_stays_undated(self) -> None:
+        items = [
+            Task(
+                task_id="aa", text="water plants", due=TODAY, done=True, recurring=True
+            )
+        ]
+        out = render_list(items, TODAY, show_dates=False)
+        assert "— due" not in out
+
     def test_today_item_has_no_due_suffix(self) -> None:
         items = [Task(task_id="aa", text="task", due=TODAY)]
         out = render_list(items, TODAY, show_dates=False)

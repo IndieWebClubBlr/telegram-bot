@@ -60,6 +60,11 @@ class Task:
     done: bool = False
     recurring: bool = False
     assignee: str | None = None
+    # A completed recurring task's next occurrence, as returned by
+    # Todoist.  `due` stays on the occurrence that was completed: a
+    # later fetch of the rolled task must not be mistaken for the same
+    # (locally completed) occurrence and filtered out of a list.
+    rolled_due: date | None = None
 
 
 @dataclass
@@ -225,13 +230,19 @@ def drop_locally_done(
     and this chat's turn must not be reverted by the later put_tasks
     nor re-rendered as active.  `done=True` is the only unambiguous
     "local is newer" signal — it is set solely after a successful API
-    close, and a recurring roll gets a fresh task id.
+    close.
+
+    The comparison is per occurrence, not per task id: completing a
+    recurring task keeps `due` on the occurrence that was completed
+    (the rolled date lives in `rolled_due`).  A pre-completion fetch
+    therefore matches the stored due and is filtered; the next
+    occurrence has a different due and is kept.
     """
     tasks = get_tasks(chat_data)
     out: list[Task] = []
     for entity in entities:
         stored = tasks.get(entity.task_id)
-        if stored is not None and stored.done:
+        if stored is not None and stored.done and stored.due == entity.due:
             continue
         out.append(entity)
     return out
@@ -485,7 +496,7 @@ def apply_event(item: Task, event: Event) -> Task:
     if isinstance(event, Complete):
         updates: dict[str, Any] = {"done": True}
         if not isinstance(event.due, _UnsetType):
-            updates["due"] = event.due
+            updates["rolled_due"] = event.due
         return replace(item, **updates)
     if isinstance(event, Reopen):
         return replace(item, done=False)

@@ -345,7 +345,7 @@ class TestDone:
         chat_data: dict[str, Any] = {}
         seed_chat_list(
             chat_data,
-            {"5c": make_state_task("5c", "buy milk", recurring=True)},
+            {"5c": make_state_task("5c", "buy milk", due=today, recurring=True)},
             day=today,
         )
         fakes = build_fakes(args=["5c"], chat_data=chat_data)
@@ -353,6 +353,12 @@ class TestDone:
         assert todoist.method_calls("get_task") == [("get_task", "5c")]
         texts = fakes.bot.sent_texts()
         assert any("next occurrence:" in t for t in texts)
+        stored = get_tasks(chat_data)["5c"]
+        assert stored.done
+        # due stays on the completed occurrence; the roll is separate so
+        # the next morning does not suppress the next occurrence.
+        assert stored.due == today
+        assert stored.rolled_due == next_due
 
 
 # ---------------------------------------------------------------- Undo

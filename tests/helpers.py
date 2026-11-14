@@ -357,6 +357,7 @@ def make_state_task(
     done: bool = False,
     recurring: bool = False,
     assignee: str | None = None,
+    rolled_due: Any = None,
 ) -> Task:
     return Task(
         task_id=task_id,
@@ -365,6 +366,7 @@ def make_state_task(
         done=done,
         recurring=recurring,
         assignee=assignee,
+        rolled_due=rolled_due,
     )
 
 

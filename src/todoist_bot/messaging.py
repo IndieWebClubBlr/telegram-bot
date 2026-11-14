@@ -319,10 +319,13 @@ def render_list(
     storage.  With show_dates (used by /tomorrow, /week and /mine) every
     line carries its due date so multi-day lists are readable; /today
     only dates overdue lines.  Done items keep their date in multi-day
-    lists too — the strike-through already marks them.  Assignees
-    (resolved at fetch time) render between the task text and the due
-    suffix.  dividers maps an item index to a bold section header
-    printed above that line (/mine's Due/Upcoming/No date sections).
+    lists too — the strike-through already marks them.  A completed
+    recurring item shows its rolled next-occurrence date everywhere,
+    including /today and the morning list, since that is the date the
+    visible strike now represents.  Assignees (resolved at fetch time)
+    render between the task text and the due suffix.  dividers maps an
+    item index to a bold section header printed above that line
+    (/mine's Due/Upcoming/No date sections).
     """
     if mentions is None:
         mentions = {}
@@ -342,8 +345,10 @@ def render_list(
             f"<code>[{padded}]</code>  {marker}{body}"
             f"{assignee_suffix(item.assignee, mentions)}"
         )
-        if item.due is not None and (show_dates or overdue):
-            line += f" — due {fmt_due(item.due, today)}"
+        rolled = item.done and item.rolled_due is not None
+        shown_due = item.rolled_due if rolled else item.due
+        if shown_due is not None and (show_dates or overdue or rolled):
+            line += f" — due {fmt_due(shown_due, today)}"
         lines.append(line)
     return "\n".join(lines)
 

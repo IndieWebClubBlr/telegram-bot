@@ -66,6 +66,7 @@ def _task(
     done: bool = False,
     recurring: bool = False,
     assignee: str | None = None,
+    rolled_due: date | None = None,
 ) -> Task:
     return Task(
         task_id=task_id,
@@ -74,6 +75,7 @@ def _task(
         done=done,
         recurring=recurring,
         assignee=assignee,
+        rolled_due=rolled_due,
     )
 
 
@@ -362,6 +364,23 @@ class TestDropLocallyDone:
         data = _chat_data(tasks=[_task("ab", done=True)])
         assert drop_locally_done(data, [_task("ab"), _task("cd")]) == [_task("cd")]
 
+    def test_keeps_next_occurrence_of_locally_done_recurring(self) -> None:
+        # The completed occurrence was yesterday; today's fetch is the
+        # rolled next occurrence and must be announced.
+        yesterday = TODAY - timedelta(days=1)
+        stored = _task("ab", due=yesterday, done=True, recurring=True, rolled_due=TODAY)
+        data = _chat_data(tasks=[stored])
+        fetched = [_task("ab", due=TODAY, recurring=True)]
+        assert drop_locally_done(data, fetched) == fetched
+
+    def test_drops_same_occurrence_of_locally_done_recurring(self) -> None:
+        # A fetch that raced the completion carries the completed
+        # occurrence's due date, so it is still suppressed.
+        tomorrow = TODAY + timedelta(days=1)
+        stored = _task("ab", due=TODAY, done=True, recurring=True, rolled_due=tomorrow)
+        data = _chat_data(tasks=[stored])
+        assert drop_locally_done(data, [_task("ab", due=TODAY, recurring=True)]) == []
+
     def test_keeps_active_and_unseen(self) -> None:
         # done=False stays (still due); an id the map has never seen
         # (first cycle / foreign fetch) also stays.
@@ -599,11 +618,14 @@ class TestApplyEvent:
         assert out.done is True
         assert out.due == TODAY
 
-    def test_complete_date_sets_due_and_strikes(self) -> None:
+    def test_complete_date_records_rolled_occurrence_and_strikes(self) -> None:
+        # due stays on the completed occurrence so a later fetch of the
+        # rolled task is not mistaken for that same occurrence.
         rolled = TODAY + timedelta(days=1)
         out = apply_event(_task("ab", due=TODAY), Complete(due=rolled))
         assert out.done is True
-        assert out.due == rolled
+        assert out.due == TODAY
+        assert out.rolled_due == rolled
 
     def test_reopen_unstrikes_keeps_fields(self) -> None:
         item = _task("ab", text="milk", due=TODAY, done=True, assignee="Priya")

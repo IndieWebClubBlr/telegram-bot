@@ -146,8 +146,11 @@ boolean flags, so command code has to handle each case.
 
 ### Local rendering follows remote truth for recurring tasks
 
-Completing a recurring task does not just strike it out: Todoist rolls it to
-the next occurrence, and the local strike is annotated with that rolled date.
+Completing a recurring task does not just strike it out: Todoist rolls the
+same task id to the next occurrence, and the local strike is annotated with
+that rolled date. The completed occurrence's date is kept separately from the
+rolled date, so a later fetch of the next occurrence is not mistaken for the
+occurrence this chat already completed and filtered out of the morning list.
 Reopening such a task is refused locally because it would close the next
 occurrence instead of restoring the previous one. Local state never invents a
 next date; it uses what the API returned.
